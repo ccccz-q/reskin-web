@@ -1,0 +1,88 @@
+# 家族：超现实拼贴
+# 来源模板：提示词10 第 3 部分（19 个里唯一一个原生结构化、带占位符的英文模板）
+# 特点：主体不变、背景替换为 2-3 块巨大平涂色形、加入一个源自原图的"不可能巨物"
+# 注：本家族提示词保留英文——该风格的视觉词汇（flat matte / pop collage）用英文命中率更高
+kind: family
+id: surreal_collage
+name: 超现实拼贴
+icon: 🟦
+description: 主体原样保留，背景换成巨大平涂色块，并加入一个源自原图的不可能巨物
+layout: full
+default_aspect: "3:4"
+# 背景本来就要被完全替换，反推 forbid 只保护主体本身
+forbid_scope: subject
+allow_change: [color, background, detail_density, material]
+suitable: [主体单一、可以从背景里干净剥离的照片, 人像, 静物, 单体建筑]
+
+hard_forbid:
+  - 渐变（no gradients）
+  - 阴影（no shadows）
+  - 画面文字与水印（no text, no watermark）
+  - 主体变形、主体颜色改变
+  - 背景保留写实照片内容
+  - 3D 渲染感、写实光影
+
+params:
+  aspect:
+    type: enum
+    options: ["3:4", "1:1"]
+    default: "3:4"
+  subject:
+    type: string
+    source: from_photo
+    default: auto
+  detail_constraint:
+    type: string
+    default: ""               # 例：hands empty, no props
+  flat_shapes:
+    type: list
+    source: llm_generated     # 2-3 个平涂色形 + 颜色
+    default: auto
+  giant_element:
+    type: string
+    source: llm_generated     # 唯一巨物，必须源自原图
+    default: auto
+  small_elements:
+    type: string
+    source: llm_generated     # 小元素群，沿弧线按尺寸渐变排列
+    default: auto
+  graffiti:
+    type: bool
+    default: true             # a few white hand-drawn graffiti strokes
+  text_role:
+    type: enum
+    options: [none]
+    default: none
+
+segments:
+  preserve: |
+    Keep the {subject} clearly recognizable, keep its original colors intact.
+    {detail_constraint}
+
+  creative: |
+    Surreal pop collage, vertical {aspect}.
+    The background is replaced by huge flat matte color shapes: {flat_shapes_desc}.
+    One impossible giant element: {giant_element}.
+    {small_elements_desc} in graduated sizes following an arc.
+    {graffiti_block}
+    Flat matte colors, no gradients, no shadows, no text, no watermark.
+
+  forbid: |
+    No gradients, no shadows, no text, no watermark.
+    Do not distort the {subject}, do not change its original colors,
+    do not keep any realistic photographic background.
+    {dynamic_forbid}
+
+graffiti_blocks:
+  true: "A few white hand-drawn graffiti strokes."
+  false: ""
+
+variants:
+  - id: surreal_default
+    name: 超现实拼贴
+    source: 提示词10c
+    params: {aspect: "3:4", graffiti: true}
+  - id: surreal_square
+    name: 超现实拼贴·方版
+    source: 派生
+    params: {aspect: "1:1", graffiti: true}

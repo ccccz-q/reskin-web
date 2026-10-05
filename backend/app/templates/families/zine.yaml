@@ -1,0 +1,136 @@
+# 家族：拾景纸刊（撕纸拼贴海报）
+# 来源模板：提示词1 / 提示词6 / 提示词9 / 提示词10 第1部分
+# 方法论来源：开源 gathered-scenes-zine-skill 的公开方法论（仓库本身不引入，见总纲 §7）
+kind: family
+id: zine
+name: 拾景纸刊
+icon: ✂️
+description: 真实照片从撕裂的纸边下显露，其余延展为温暖旧纸上的抽象插画场域
+layout: tear                 # 手撕纤维开窗
+default_aspect: "3:5"
+# 反推 forbid 只作用于撕纸窗口内的实景部分；窗口外的插画区不受"人数/细节"类约束，
+# 否则会和 creative 的"人群合并成大色块"直接打架
+forbid_scope: real_region
+allow_change: [color, light, detail_density, background, material, text_add, edge]
+suitable: [风景旅行照, 城市街拍, 建筑局部, 有强轮廓主体的照片]
+
+# ── 固有禁止项：硬编码，参数改不动 ──────────────────────
+hard_forbid:
+  - 完整描摹照片
+  - 细密树叶、逐一描绘的纹理
+  - 数字矩形裁切、规则撕纸框
+  - 贴纸白边、发光或投影等 3D 效果
+  - 多种鲜艳颜色并存
+  - 商业广告感、电影光影、动漫风格
+  - 密集拼贴、长文字、错别字、水印
+
+# ── 可调参数 ────────────────────────────────────────
+params:
+  aspect:
+    type: enum
+    options: ["3:5", "3:4"]
+    default: "3:5"
+  fidelity:
+    type: enum
+    options: [light, medium, heavy]
+    default: medium
+  tear_logic:
+    type: enum
+    options: [contour, division, focal_window]
+    default: contour
+  photo_ratio:
+    type: number
+    range: [0.30, 0.70]      # 0.30-0.50 为标准纸刊；0.65 左右为提示词9 的"手绘仅占30-35%"轻改版
+    default: 0.40
+  abstraction:
+    type: enum
+    options: [mid, high]
+    default: high
+  render:
+    type: enum
+    options: [gouache, ink_wash]
+    default: gouache
+  substrate:
+    type: enum
+    options: [warm_ivory, old_yellow]
+    default: warm_ivory
+  crossing_color:
+    type: string
+    source: from_photo        # 从原图占比最高的颜色里挑一个高饱和的
+    default: auto
+  text_role:
+    type: enum
+    options: [micro_typewriter, none]
+    default: micro_typewriter
+  text_lang:
+    type: enum
+    options: [en, zh]
+    default: en
+  figures:
+    type: enum
+    options: ["0"]
+    default: "0"
+
+# ── 枚举 → 文案 字典 ────────────────────────────────
+dicts:
+  tear_logic:
+    contour: 轮廓顺应——沿核心主体的自然轮廓撕裂，剥离原始背景，让主体如同从纸面中生长出来
+    division: 空间分割——顺应画面原有的透视线或对角线做大面积不规则对角/侧边撕裂，形成平面空间对峙
+    focal_window: 焦点开窗——围绕核心视觉焦点在纸张中央撕开一个不规则孔洞，透过撕口露出真实摄影局部
+  substrate:
+    warm_ivory: 暖调米白做旧艺术纸
+    old_yellow: 旧米黄纸张
+  abstraction:
+    mid: 60%-70%
+    high: 75%-85%
+  render:
+    gouache: 分层平涂的柔和色块
+    ink_wash: 毛笔淡墨晕染笔触
+
+# ── 三段式模板（{param} 来自参数，{slot} 来自提炼卡）────
+segments:
+  preserve: |
+    严格保留参考图的实景区域：核心主体「{subject.name}」的真实摄影质感、原始色彩、关键空间关系与光影方向。
+    实景区域占画面约 {photo_ratio:.0%}，只允许等比裁切，不得重绘、不得插画化、不得重新设计照片内容。
+
+  creative: |
+    其余部分延展为{substrate_desc}上的抽象插画场域，插画约占 {illustration_ratio:.0%}。
+    插画只提炼原图中的 {anchor_count} 个{anchor_desc}，删除 {detail_removal} 的细节；
+    树叶、人群与复杂纹理必须合并成少量大色块、断裂线条或剪纸形状，保留大量空白，不得逐一描绘。
+    实景与纸张交界处必须有清晰、不规则的手撕纤维边缘，撕裂逻辑采用「{tear_logic_desc}」：
+    边缘需表现不规则的锯齿、裸露的纸张纤维须边、局部磨损与露出的温暖纸张底色，严禁干净的数字蒙版。
+    插画表现：{render_desc}。纸面质感：细腻纤维、克制的斑点、轻微扫描噪点、平面印刷油墨吸附感，保持纯二维平面。
+    加入一种源自原图的高饱和颜色「{crossing_color}」，让它沿真实轮廓跨越照片与插画，
+    承担引导视线或平衡构图的作用，不能只是孤立色块或装饰圆点。
+    {text_block}
+
+  forbid: |
+    避免：{hard_forbid_joined}。
+    {dynamic_forbid}
+
+# ── 文本块（按 text_role 展开）──────────────────────
+text_blocks:
+  micro_typewriter: |
+    在安静的留白区左上角添加一处极小的微型文本：复古打字机细黑字体{text_lang_desc}，
+    字数极简（一行不超过 5 个单词），文案由原图景物与拍摄地生成，完美融入纸张纹理，
+    不可使用光洁的现代数字显示字体。
+  none: ""
+
+# ── 预设变体（对应原 19 个里的成员）───────────────────
+variants:
+  - id: zine_classic
+    name: 纸刊经典
+    source: 提示词1
+    params: {tear_logic: contour, photo_ratio: 0.40, abstraction: high, text_role: micro_typewriter}
+  - id: zine_division
+    name: 纸刊·对角分割
+    source: 提示词6
+    params: {tear_logic: division, photo_ratio: 0.30, abstraction: mid}
+  - id: zine_window
+    name: 纸刊·焦点开窗
+    source: 提示词6
+    params: {tear_logic: focal_window, photo_ratio: 0.35}
+  - id: zine_soft
+    name: 纸刊·水墨柔化
+    source: 提示词9
+    params: {tear_logic: contour, photo_ratio: 0.65, render: ink_wash, substrate: old_yellow, abstraction: mid}

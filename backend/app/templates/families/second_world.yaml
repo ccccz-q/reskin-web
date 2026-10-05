@@ -1,0 +1,136 @@
+# 家族：第二世界（摄影二创海报）
+# 来源模板：提示词14（规范版：主体锁定规则、严格1:1、具体禁止项） + 提示词19（原则版：不要套模板、先理解照片）
+# 合并原则：19 的"先观察后创作"进 creative，14 的硬约束进 preserve + forbid
+kind: family
+id: second_world
+name: 第二世界
+icon: 🌀
+description: 上半忠实保留原照，下半把照片里的某个视觉结构变成一块可触碰、可使用的立体摄影物体
+layout: split_v
+default_aspect: "3:4"
+split_ratio: "1:1"           # 严格 1:1
+# 反推 forbid 只作用于上半原照区；下半是"第二世界"，允许改变物理属性
+forbid_scope: upper
+allow_change: [background, material, figure_add, object_form, text_add]
+suitable: [有水纹/道路/倒影/云层/枝条/影子/建筑开口/山脊等可物化结构的照片, 风景, 街拍]
+
+hard_forbid:
+  - 整张图重绘或插画化
+  - 只做「撕纸 + 小人」的套路模板
+  - 下半区没有摄影物体、只剩线稿
+  - 随意添加树叶、星星、爱心等无关装饰
+  - 商业广告感、复杂插画感、密集元素
+  - 重复使用陈词滥调文案（如 "Same..., different..."）
+  - 擅自改变原照片色彩或重新设计摄影内容
+  - 下半区主体消失、被裁碎或沦为装饰
+
+params:
+  aspect:
+    type: enum
+    options: ["3:4"]
+    default: "3:4"
+  materialize_anchor:
+    type: string
+    source: from_photo        # 从提炼卡 anchors 里挑 materializable=true 的第一个
+    default: auto
+  object_form:
+    type: string
+    source: llm_generated     # 由模型根据锚点生成："这块水会变成什么可被触碰的东西"
+    default: auto
+  figures:
+    type: enum
+    options: ["0", "0_2", "0_3"]
+    default: "0_3"
+  interaction:
+    type: string
+    source: llm_generated     # 拉开/推开/撑住/铺平/划行/进入/提起/修补/展开……
+    default: auto
+  substrate:
+    type: enum
+    options: [warm_ivory]
+    default: warm_ivory
+  text_role:
+    type: enum
+    options: [handwritten, none]
+    default: handwritten
+  text_lang:
+    type: enum
+    options: [en]
+    default: en
+
+dicts:
+  figures:
+    "0": 不新增小人
+    "0_2": 可加入 0-2 个极简黑色线稿小人
+    "0_3": 可加入 0-3 个极简黑色手绘线稿人物
+  # ⚠️ substrate 必须在这里登记，否则 {substrate_desc} 无处可查。
+  #    历史 bug：params 里声明了 substrate 枚举、segments 里引用了 {substrate_desc}，
+  #    但 dicts 里没有对应映射 → 渲染时该占位符无法解析，strict 模式直接抛错。
+  #    而 validate_families.py 当时也能通过 —— 因为它的 FAKE_VALUES 里有 substrate_desc
+  #    这条「万能兜底」，把真实缺口掩盖了。现在校验器改用渲染器同源解析，此类问题无处可藏。
+  #    规则：dicts 必须覆盖所有 params.<enum>，缺一即报错。
+  substrate:
+    warm_ivory: 自然的暖米白纸张
+
+# 整句必须放在这里，不能写成 "{figures_block}小人不是装饰…"
+# —— 当 figures:"0" 时 figures_block 为空串，会拼成「小人不是装饰」，语义完全反了
+figures_blocks:
+  "0": |
+    若原照片已有很强的人物动作，可以不新增小人。
+  "0_2": |
+    加入 0-2 个极简黑色线稿小人。小人不是装饰，而是这个第二世界里的"使用者"，
+    必须真的与这块摄影物体互动（{interaction}），而不是站在旁边摆姿势。
+    若原照片已有很强的人物动作，可以不新增小人。
+  "0_3": |
+    可加入 0-3 个极简黑色手绘线稿人物。小人不是装饰，而是这个第二世界里的"使用者"，
+    他们必须真的与这块摄影物体互动（{interaction}），而不是站在旁边摆姿势。
+    若原照片已有很强的人物动作，可以不新增小人。
+
+segments:
+  preserve: |
+    画面严格上下 1:1。
+    上半部分必须是原照片本体，只允许等比裁切，保留原有主体、人物、空间关系、色彩与自然光影，
+    不得重绘、不得改成插画、不得重新设计照片内容。
+    主体锁定：先识别照片中视觉权重最高的核心主体「{subject.name}」。
+    {subject.name} 必须完整、清晰、可辨认，不得消失、被裁碎或沦为装饰；
+    天空、水面、道路、云层等背景元素只能辅助创意，不得取代主体。
+
+  creative: |
+    下半部分使用{substrate_desc}背景，保留大量留白。
+    【核心创意 · 先观察再创作，不要套用固定模板】
+    先观察原照片里最有辨识度的视觉结构——「{materialize_anchor}」，
+    然后问：如果这个结构真的变成一种可以被触碰、使用或改变的东西，它最自然会是什么？
+    答案是「{object_form}」。
+    把「{materialize_anchor}」在下半区变成这样一个可触碰、可使用的"摄影物体"：
+    · 仍然保留原照片的真实摄影纹理；
+    · 具有明显 3D 立体感，像一块被拿出来的照片材料 / 薄片 / 布片 / 窗口 / 洞口 / 水面；
+    · 有边缘厚度、轻微卷曲或折起、自然投影、透视关系、与纸面的接触感；
+    · 不能只是普通撕纸边，剪贴的形状本身必须参与解释照片。
+    创意可以改变主体的物理属性，但不能改变主体的身份——看到下半部分第一眼仍必须认出原照片的核心主体。
+    {figures_block}
+    {text_block}
+    整体风格：真实摄影 + 米白纸张 + 极简黑线涂鸦，干净、明亮、克制，有轻微手工拼贴感与独立杂志感。
+
+  forbid: |
+    避免：{hard_forbid_joined}。
+    {dynamic_forbid}
+
+text_blocks:
+  handwritten: |
+    根据这张照片具体发生的事情，生成一句简短英文手写旁白，语气自然、轻松、有一点幽默或画外音感，
+    不要写成励志语录，不要重复固定句式。文字位置根据留白与动作方向决定，不固定在某个角落。
+  none: ""
+
+variants:
+  - id: second_world_strict
+    name: 第二世界·严格版
+    source: 提示词14
+    params: {figures: "0_2", text_role: handwritten}
+  - id: second_world_open
+    name: 第二世界·开放版
+    source: 提示词19
+    params: {figures: "0_3", text_role: handwritten}
+  - id: second_world_silent
+    name: 第二世界·无字版
+    source: 派生
+    params: {figures: "0_2", text_role: none}

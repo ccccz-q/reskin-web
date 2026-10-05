@@ -1,0 +1,128 @@
+# 家族：体素林径
+# 由「模板工坊」从风格理论 + 参考图自动提炼
+# 安装后可用 /api/image/render 预览；有问题可以继续迭代或手工修改本文件
+id: voxel_path_reflection
+name: 体素林径
+description: 以方块树列围合中央汇聚道路，并用自然天光与水面倒影构成清晰纵深的体素户外场景。
+icon: 🌲
+layout: full
+forbid_scope: whole
+default_aspect: origin
+allow_change:
+- identity
+- figure_add
+- detail_density
+- color
+- light
+- background
+- material
+- text_add
+- edge
+- object_form
+suitable:
+- 适合生成具有明确道路、桥梁或水岸纵深的 Minecraft 风格户外环境
+- 适合表现方块树木、建筑、云朵、水面倒影与自然光影
+- 适合制作干净通透、细节丰富的第三人称体素场景
+- 适合将新主体融入林荫道路、临水聚落或方块园林空间
+hard_forbid:
+- 不得添加任何文字、标志、logo、品牌信息、水印或界面元素
+- 不得复制原图中方块人物的具体服装颜色、身份信息、外观细节或可识别私人特征
+- 不得复制原图中两个方块人物的具体排列、姿态或个体识别特征
+- 不得逐一复制原图建筑、桥梁、树木、灯笼的布局或独特组合
+- 不得出现非方块的圆滑树干、云朵、人物肢体、建筑轮廓或水岸结构
+- 不得生成没有体素结构的纯写实照片、模糊画面或无结构材质
+- 不得使用畸形人物、额外肢体、断裂结构、杂乱线条或低分辨率纹理
+- 不得让雾化、过曝、强烈虚化或装饰性光晕遮蔽道路、树列和水面的空间关系
+params:
+  light_mode:
+    type: enum
+    label: 光照模式
+    options:
+    - clear_day
+    - warm_side_light
+    - winter_glow
+    option_labels:
+    - 晴朗自然光
+    - 暖色斜射光
+    - 冬日冷暖光
+    default: clear_day
+    required: true
+  water_position:
+    type: enum
+    label: 水面位置
+    options:
+    - side_water
+    - lower_reflection
+    - shoreline
+    option_labels:
+    - 道路侧方
+    - 画面下方
+    - 岸线外侧
+    default: side_water
+    required: true
+  path_focus:
+    type: enum
+    label: 路径焦点
+    options:
+    - vanishing_point
+    - distant_pavilion
+    - bridge_endpoint
+    option_labels:
+    - 远处消失点
+    - 中远景亭阁
+    - 远处桥端
+    default: vanishing_point
+    required: true
+  detail_level:
+    type: enum
+    label: 细节密度
+    options:
+    - clean
+    - rich
+    - maximum
+    option_labels:
+    - 干净清晰
+    - 丰富可读
+    - 高密度细节
+    default: rich
+    required: true
+dicts:
+  light_mode:
+    clear_day: 使用明亮蓝天天光，明部清楚，阴影柔和，暗部保持密度
+    warm_side_light: 使用从侧方斜射的暖色自然光，只照亮部分树干、铺面、灯具和水面
+    winter_glow: 使用冷色环境光搭配少量暖色局部光，浅色表面呈灰白明部与蓝灰阴影
+  water_position:
+    side_water: 将平整方块水面放在道路或岸边侧方，并保留天空、树木与光线倒影
+    lower_reflection: 让水面覆盖画面下方区域，保持岸线、实体与上下对应的倒影关系
+    shoreline: 将水面放在岸线或实体下方，以低对比反射补充临水空间信息
+  path_focus:
+    vanishing_point: 让道路中央的铺面和两列树木共同指向接近地平线的明确远处消失点
+    distant_pavilion: 让道路或桥面由前景收束至中远景方块亭阁，亭阁成为路径终点
+    bridge_endpoint: 让道路或水岸结构沿纵向汇聚至远处桥端，桥端承担空间焦点
+  detail_level:
+    clean: 保留大块方形体积、路径边界和主要倒影，减少次要装饰
+    rich: 在树叶、树干、道路、云朵、水面和建筑上加入可辨认的体素纹理
+    maximum: 提高方块材质、铺面、植被、倒影和远景层次的细节密度，同时保持轮廓与路径方向清楚
+segments:
+  preserve: 保留完整的第三人称体素户外环境、中央通行路径、两侧成组方块树木或建筑边界、自然天光、深色阴影和位于岸线或实体下方的反射水面。保留近景大体积边界、中景主体、远景尺度递减和清晰空间纵深。四个结构锚点保持为新场景的空间骨架：两列树干与灯具组成的向远处收束的平行廊道；道路中央铺面、横向树影和两侧浅色边缘共同形成的长条形透视结构；道路两侧边缘向画面中央远处收束；高大树干以近大远小的尺度变化沿道路两侧重复排列，树冠在上方形成拱形遮挡。主体语义保持为{{subject.name}}，但具体建筑、人物、树木和地点身份必须重新设计。
+  creative: 使用清晰的正方形方块单元拼接所有树木、树冠、道路、建筑、云朵、灯具和水面，保留直角边缘与可辨认的体素纹理。让重复排列的主体沿道路两侧由近及远缩小，并共同指向{path_focus_desc}。让近处深色树干和树冠形成两侧边界，把明亮路径留在中央；使用{light_mode_desc}，仅在局部形成接近纸白的高光，暗部保持密度。{water_position_desc}。按{detail_level_desc}处理树叶、铺面、云朵、建筑表面和倒影，保持宽阔的第三人称游戏空间视野与自然纵深。
+  forbid: '禁止出现原图中的文字、标志、logo、品牌、水印、界面元素或私人信息；禁止复制原图方块人物的身份、服装颜色、排列、姿态和可识别外观。禁止逐一复刻原图建筑、桥梁、树木、灯笼的布局或独特组合。{{hard_forbid_joined}}。{{dynamic_forbid}}
+
+    - 不得出现：未观察到可辨认的文字、标志或品牌信息，不应向新场景添加任何文字或标志。
+
+    - 不得出现：两个方块人物的具体服装颜色和身份信息不应被复制为可识别的私人特征。
+
+    - 不得出现：不应泄漏原图中两个方块人物的具体排列、外观细节或任何可用于识别个体的特征。
+
+    - 不得出现：未观察到具体文字、logo或可识别的私人特征。
+
+    - 不得出现：新场景不得复制原图中建筑、桥梁、树木和灯笼的逐一布局或独特组合。
+
+    - 不得出现：新场景不得泄漏原图中任何可识别的具体标识、界面元素、水印或私人信息。'
+card_all_rules:
+- 让重复排列的主体沿道路两侧由近及远缩小，并共同指向一个明确的远处消失点。
+- 让近处的大面积树干和树冠形成深色边界，把明亮的道路或主要路径保留在画面中央。
+- 让暖色斜射光只照亮部分树干、铺面、灯具和水面，使高光接近纸白而不提亮整幅画面，暗部保留密度。
+- 让所有主体由清晰的方块单元拼接构成，并在树叶、树干、道路、云朵和人物上保持可辨认的体素纹理。
+- 让水面位于道路或岸边之外，并同时反射天空、树木和光线，以补充地点信息而不取代道路纵深。
+kind: family

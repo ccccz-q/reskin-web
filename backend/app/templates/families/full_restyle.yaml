@@ -1,0 +1,169 @@
+# 家族：全幅风格重绘
+# 来源模板：提示词2 / 3 / 4 / 5 / 7 / 15 / 17
+# 共同点：构图、主体位置、物体比例、空间关系完全不变，只换风格、材质或光影
+# 注：提示词7 与项目已有 travel_sketch.yaml 几乎一致，直接复用
+kind: family
+id: full_restyle
+name: 全幅风格重绘
+icon: 🎨
+description: 构图与主体一动不动，只把照片整体换算一种风格、材质或光影
+layout: full
+default_aspect: origin       # 跟随原图，不裁不换画幅（省钱 + 不变形）
+# 整幅重绘，无处可逃，反推 forbid 必须作用于全画面
+forbid_scope: whole
+# 本家族的 allow_change 是「动态白名单」：不像其他家族写一个固定列表，
+# 而是按 style 从下方 style_allow_change 里取（写实风只改 2 个维度，材质风改 4 个）。
+# 校验器看到 allow_change_mode: dynamic 时，不再要求顶层 allow_change。
+allow_change_mode: dynamic
+suitable: [任何照片, 尤其构图已经很好只想换风格的]
+
+hard_forbid:
+  - 改变构图、改变主体位置、改变物体比例
+  - 增加或删除画面中的物体
+  - 改变人物数量、人物动作与服装特征
+  - 改变地平线高度与画面透视
+
+params:
+  style:
+    type: enum
+    options: [rembrandt_dark, national_geo, cinematic_city, fabric_thread, travel_sketch, cg_render, pen_wash_journal]
+    default: travel_sketch
+  aspect:
+    type: enum
+    options: [origin]
+    default: origin
+  fidelity:
+    type: enum
+    options: [light, medium, heavy]
+    default: heavy           # 本家族唯一使命就是"只换风格"，保真必须最严
+  abstraction:
+    type: enum
+    options: [low, mid]
+    default: low
+  text_role:
+    type: enum
+    options: [none, handwritten, micro_embroidery]
+    default: handwritten
+  edge:
+    type: enum
+    options: [hard, bleed]
+    default: hard
+  color_swatches:
+    type: bool
+    default: false           # 提示词17 专属：右下角 4 个圆角方形色卡
+  resolution_hint:
+    type: enum
+    options: ["8K", "4K", none]
+    default: "4K"
+
+# ── 每种风格独占的 creative 正文 ──────────────────────
+styles:
+  rembrandt_dark: |
+    单侧伦勃朗式斜侧硬质定向光，照亮主体的一侧，另一侧沉入暗部，明暗交界明确。
+    低饱和暗调纪实调色，浅景深虚化背景。8K 超高清。
+
+  national_geo: |
+    复刻《国家地理》式纪实摄影调色：色彩浓郁厚重、光影立体硬朗、细节锐利、对比强烈，
+    呈现专业地理摄影的质感与冲击力。
+
+  cinematic_city: |
+    电影感城市摄影：自然光斜向进入画面，硬光切割出明确的明暗区域，
+    保留城市空间的纵深与秩序，呈现电影剧照般的质感。
+
+  fabric_thread: |
+    8K 写实的布艺拼贴刺绣插画：以浅米色粗亚麻画布为底，大面积留白。
+    用格纹棉布、水洗粗麻布、纯色亚麻与复古补丁布片重新构成画面，
+    保留主体的前景、中景、后景（天空、建筑、树木、水面倒影），
+    以平针、回针、交叉绣线表现轮廓与细节，边缘保留手工撕扯的毛边、旧布磨损、线头与流苏。
+
+  travel_sketch: |
+    想象一位画家坐在现场，用一页速写本把眼前的景象记下来：
+    先用铅笔轻轻勾出结构，有些地方就此停笔，只留下几根未收完的线；
+    再用水彩薄薄地铺开，颜色不必填满轮廓，允许溢出与飞白；
+    钢笔只在关键处补上几笔肯定的线条，把人物姿态和建筑的重点再强调一次。
+    人物几笔带过即可，抓住姿态与衣着的大形，不交代五官细节。
+    纸面是米白速写纸，能看到纸纹、铅笔的石墨颗粒、水彩干涸后留下的边缘与零星溅点，
+    画面里留出大片未落笔的空白，笔触的疏密随观察的深入自然变化。
+
+  cg_render: |
+    3A 游戏 CG 渲染风格的景观，虚幻引擎 5 级别材质与体积光，电影级光影与 HDR，
+    超高精度贴图与真实反射，呈现顶级游戏过场动画的质感。
+
+  pen_wash_journal: |
+    钢笔淡彩手账式旅行插画：钢笔画出清晰的结构轮廓，淡彩填入通透的颜色，
+    画面四周做不规则的水彩晕染并向外自然淡出，无硬边框。
+
+# 同一家族不同风格差异极大，allow_change 按风格给；
+# 反推 forbid 遇到白名单里的维度自动跳过（否则"暗调风格要求改光影"会和"不得改光影"直接互斥）
+style_allow_change:
+  rembrandt_dark:  [light, color, material]
+  national_geo:    [color, material]
+  cinematic_city:  [light, color, material]
+  fabric_thread:   [material, detail_density, color]
+  travel_sketch:   [material, detail_density, color]
+  cg_render:       [material, detail_density, light, color]
+  pen_wash_journal: [material, detail_density, color, edge]
+
+segments:
+  preserve: |
+    在参考图给定的构图之上作画：**主体位置、物体比例、空间关系、人物数量与动作一律照搬**，
+    不增删任何物体，不改变地平线高度与透视。
+    {palette_keep}
+
+  creative: |
+    {style_block}
+    {edge_block}
+    {swatches_block}
+    {text_block}
+
+  forbid: |
+    避免：{hard_forbid_joined}。
+    {dynamic_forbid}
+
+edge_blocks:
+  hard: ""
+  bleed: |
+    画面四周不要加硬边框，让水彩自然向外晕染并淡出，留白不能与原画面有割裂感。
+
+swatches_blocks:
+  true: |
+    在画面右下角绘制 4 个小的圆角方形色卡，颜色取自原图的 4 种主色调，作为配色注记。
+  false: ""
+
+text_blocks:
+  handwritten: |
+    底部留白处添加与原画面相符的英文手写文字标题，标题下方是一句英文手写短句，
+    字体随性、拒绝数字化，不添加多余装饰元素。
+  micro_embroidery: |
+    留白处以小号英文刺绣线迹绣出一行极简文字，作为手工布艺的注记。
+  none: ""
+
+variants:
+  - id: restyle_rembrandt
+    name: 伦勃朗暗调
+    source: 提示词2
+    params: {style: rembrandt_dark, text_role: none, resolution_hint: "8K"}
+  - id: restyle_natgeo
+    name: 国家地理调色
+    source: 提示词3
+    params: {style: national_geo, text_role: none}
+  - id: restyle_cinematic
+    name: 电影感城市
+    source: 提示词4
+    params: {style: cinematic_city, text_role: none}
+  - id: restyle_fabric
+    name: 布艺刺绣拼贴
+    source: 提示词5
+    params: {style: fabric_thread, text_role: micro_embroidery, resolution_hint: "8K"}
+  - id: restyle_sketch
+    name: 艺术家旅行手稿
+    source: 提示词7 / travel_sketch.yaml
+    params: {style: travel_sketch, text_role: handwritten}
+  - id: restyle_cg
+    name: 3A 游戏 CG
+    source: 提示词15
+    params: {style: cg_render, text_role: none}
+  - id: restyle_journal
+    name: 钢笔淡彩手账
+    source: 提示词17
+    params: {style: pen_wash_journal, text_role: handwritten, edge: bleed, color_swatches: true}

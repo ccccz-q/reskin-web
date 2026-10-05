@@ -1,0 +1,106 @@
+kind: family
+id: material_pixel
+name: 材料章印
+icon: 🐚
+description: 主体以天然材料像素模块重构为章印（默认整幅融合；可切上下分版），渐进消隐入留白
+layout: split_v
+default_aspect: '3:4'
+forbid_scope: whole
+allow_change:
+- color
+- detail_density
+- background
+- text_add
+suitable:
+- 有清晰主体的照片
+- 静物
+- 建筑
+- 人物
+hard_forbid:
+- 细碎噪点、标准马赛克、游戏像素感、光滑矢量、塑料质感
+- 灰脏发旧、莫兰迪暗褐、阴郁大地色、荧光色、廉价糖果感
+- 强珠光、游戏 UI、拼图网格填充整幅
+- 商业广告感与过多文字
+- 重绘或插画化原照片主体
+params:
+  layout_mode:
+    type: enum
+    options:
+    - fusion
+    - split
+    default: fusion
+  module_count:
+    type: enum
+    options:
+    - '120'
+    - '160'
+    - '200'
+    default: '160'
+  subject_share:
+    type: number
+    range:
+    - 0.3
+    - 0.45
+    default: 0.38
+  brightness:
+    type: enum
+    options:
+    - clear
+    - brighter
+    default: clear
+dicts:
+  layout_mode:
+    fusion: '整幅融合版式（画幅与原图完全一致，比例不变）：整幅为暖白纸面，
+
+      核心主体以真实摄影质感安置在画面中，像素模块沿主体的边缘与轮廓向外生长、
+
+      逸散到纸面留白里——模块与主体共存于同一画面，没有水平分界线，没有上下拼接。
+
+      '
+    split: '上下分区版式（两区高度严格 1:1，各占 50%）：上半区为原照片本体
+
+      （只做轻微调色，不得重绘）；下半区为材料像素景观。
+
+      '
+  brightness:
+    clear: 从原照最明快鲜活、有生命力的颜色重新调制，适度提高明度与通透感
+    brighter: 由原照推出清澈天空蓝、湖水青、嫩绿、暖黄、珊瑚橙、桃粉等明快综合色
+segments:
+  preserve: '画幅与原图完全一致（比例不得改变）。
+
+    保留原照主体「{subject.name}」的身份、结构、姿态、真实质感、自然光影方向与色相关系，
+
+    仅做轻微调色：统一白平衡、保留原照的明度范围与色相顺序；不拉伸不扭曲不改变主体。
+
+    '
+  creative: '版式：{layout_mode_desc}
+
+    先理解原照最具记忆点的主体、构图、透视与结构走势，再重构为材料拼贴感的极简像素景观——
+
+    删去无关细节，只保留最能代表原物的结构与走势，用规则方块秩序与天然材料质感重新概括，
+
+    一眼认出与原照片对应。
+
+    像素模块为粗粝贝壳、贝壳薄片或矿物壳层切割的小型方形碎片：保持几何网格秩序，边缘可略崩缺，
+
+    表面带天然层理、粉质颗粒与轻微凹凸，哑光、自然、温和。
+
+    模块总量不超过 {module_count} 块，单块大小统一或接近；
+
+    主体核心区模块密集聚合，边缘逐步减少、缺失、断开、漂浮，向留白自然逸散。
+
+    主体约占画面 {subject_share:.0%}，可偏心、贴边、悬置或裁切；
+
+    留白不是空背景，是与正负形、疏密聚散、不对称平衡同等的构成元素——宁可删减也不填满。
+
+    配色：{brightness_desc}，以大量纯净暖白或与色温协调的极浅近白作呼吸空间，
+
+    局部以暖橙、金黄、珊瑚红或柔粉点睛；保留材料的天然色差与层理。
+
+    文字极少量：从主体、地点或情绪中提炼几个字，安静置于留白或主体边缘。
+
+    '
+  forbid: '- {dynamic_forbid}'
+not_suitable:
+- 空无一物的纯天空或纯水面
+- 多人合影

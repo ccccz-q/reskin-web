@@ -1,0 +1,162 @@
+# 家族：一景两译（整幅水粉重绘，与原图一一对应）
+# 来源模板：提示词8 ≈ 提示词10b（水墨明信片）、提示词11 ≈ 提示词16（gouache 版，16 更完整）、
+#           提示词13（材料像素拼贴）
+# 注：8 与 10b 实为同一模板，合并；11 与 16 同源，以 16 为准、11 留作简版
+#
+# ★★ 2026-10-05 第二次改版：上下分屏 → 单幅 1:1（用户实测反馈）
+#   旧版是"上半实拍 + 下半水粉提炼"的对照海报（layout: split_v、forbid_scope: upper）。
+#   用户明确要求：**不要上面原图、下面生成图**，只要一张生成图，
+#   而且这张图与原图 **1:1 对应**（同一片景、同一构图、元素位置一一对应），其他保持不动。
+#   于是：layout → full、forbid_scope → whole、去掉 split_ratio 参数与上下区表述。
+#   保留：渲染风格（gouache/ink_wash/pixel）、抽象度、色板、纸张基底、底部杂志排版。
+#
+# ★ 同日：曾一度删掉「小人叙事海报」变体（render: line_figures + figures: 6_8），
+#   理由是它与 doodle_narrators / second_world / zine 的小人叙事重复。
+#   ★ 用户决定**保留**（2026-10-05）：小人在这里不是装饰，是"给画面讲故事"的用法，
+#   与那三个家族的默认档位（人物围绕主体 / 撕纸开窗里的点缀）观感不同，留着有价值。
+#   所以 figures 参数、figures_blocks、line_figures 渲染风格全部保留。
+kind: family
+id: split_poster
+name: 一景两译
+icon: 🪟
+description: 把原照片整幅重绘成水粉插画，构图与元素与原图一一对应，不做上下分屏对照
+layout: full
+default_aspect: "2:3"
+# 整幅都是重绘区，没有"实景/重构"之分 → 作用域回到整幅
+forbid_scope: whole
+allow_change: [color, light, detail_density, background, material, figure_add, text_add]
+suitable: [城市风景, 建筑, 海岸与山景, 有清晰天际线或地平线的照片]
+
+hard_forbid:
+  - 过度 HDR、强锐化、过度修图、AI 重绘感
+  - 改动原照片的构图、视角、元素位置或主体（这张图必须与原图一一对应）
+  - 逐像素复刻照片（要的是插画化，不是把照片原样贴上去）
+  - 明显描边、卡通感、赛博朋克、3D 感、矢量图标感
+  - 边框（画面自然留白，不加描边框）
+  - 商业广告感、复杂装饰、廉价 AI 感
+
+params:
+  aspect:
+    type: enum
+    options: ["2:3", "3:4"]
+    default: "2:3"
+  fidelity:
+    type: enum
+    options: [light, medium, heavy]
+    default: heavy          # ★ 与原图 1:1 对应 → 默认给最保真的档
+  render:
+    type: enum
+    options: [gouache, ink_wash, pixel, line_figures]
+    default: gouache
+  abstraction:
+    type: enum
+    options: [mid, high]
+    default: mid            # ★ 单幅要对应原图，抽象度默认收敛（high 只留给用户主动调）
+  palette_source:
+    type: enum
+    options: [fixed, from_photo]
+    default: fixed
+  fixed_palette:
+    type: list
+    default: [warm ivory, muted navy, blue grey, smoky grey, warm ochre, mustard yellow, soft beige]
+  substrate:
+    type: enum
+    options: [warm_ivory, none]
+    default: warm_ivory
+  text_role:
+    type: enum
+    options: [footer_editorial, none]
+    default: footer_editorial
+  text_align:
+    type: enum
+    options: [left, center]
+    default: left
+  figures:
+    type: enum
+    options: ["0", "6_8"]
+    default: "0"
+
+dicts:
+  render:
+    gouache: 极简艺术插画（soft gouache、dry brush 质感、水彩般的不透明叠色、细微纸纹、手绘编辑插画、哑光印刷质感）
+    ink_wash: 水墨扁平重构插画（分层平涂的柔和色块 + 毛笔淡墨晕染笔触，彻底摒弃锐利硬边）
+    pixel: 材料拼贴感极简像素景观（贝壳/矿物壳层切割成的方形碎片，模块化排列，总模块数不超过 200 块）
+    line_figures: 极简黑线小人叙事场景（在画面中加入极简黑色线条小人）
+  abstraction:
+    mid: 保留结构神韵，剔除细碎纹理与冗余杂物
+    high: 只保留纯粹的结构关系，复杂光影一并剔除
+  # ⚠️ substrate 必须登记（同 second_world 的历史 bug：params 声明了、segments 引用了，
+  #    但 dicts 缺失 → {substrate_desc} 无法解析。规则：dicts 必须覆盖所有 params.<enum>）
+  substrate:
+    warm_ivory: 米白哑光特种纸
+    # ★ enum 的每个 option 都必须在这里登记，否则渲染期解析不到文案。
+    #   实测教训：options 里有 none 但 dicts 没登记 → 走兜底分支
+    #   → UnboundLocalError → /api/image/render 直接 500。
+    none: 无纸张基底，直接以纯色场域承载
+  # ★ 2026-10-05 补：text_align 声明了参数、text_blocks 里引用了 {text_align_desc}，
+  #   但 dicts 一直缺这一项 —— 渲染出来是空串，底部排版变成"，字号克制…"（悬空逗号）。
+  #   本地看不出来是因为它一直是这样，属历史遗留缺口，一并补上。
+  text_align:
+    left: 整体左对齐
+    center: 整体居中对齐
+
+segments:
+  preserve: |
+    这一张就是原照片本身的重绘，**与原图 1:1 对应**：同一片景、同一个视角、
+    同一构图，主体与所有景物元素的位置、数量、朝向都与原照片逐一吻合。
+    保留原照片的构图、{layers_desc}、天际线与地平线走向、建筑与景物轮廓、
+    主体元素与光影结构。
+    不得增删元素、不得挪动位置、不得改变视角或裁切范围 ——
+    变的是画法（照片 → 插画），不是画面内容。
+
+  creative: |
+    在**严格对应原图**的前提下，把整幅照片转译为插画：{render_desc}。
+    抽象处理：{abstraction_desc}。
+    建筑 / 主体结构 → 用几何色块与线面关系表达，轮廓位置与原图一致；
+    远景 → 压缩为细小矩形或轮廓剪影；云层 → 转化为柔软不规则的横向笔触；
+    天空与地面 → 只保留少量线条与大色面关系；灯光 → 用少量暖黄色小色块点缀。
+    画面铺满整幅（不做上下分屏、不做画中画），保留适度留白，元素疏朗、安静、诗意、现代。
+    {figures_block}
+    整体配色：{palette_desc}。
+    {text_block}
+
+  forbid: |
+    避免：{hard_forbid_joined}。
+    {dynamic_forbid}
+
+text_blocks:
+  footer_editorial: |
+    画面最底端加入极简杂志式英文排版：
+    主标题根据图片内容自动生成（优雅经典衬线字体，深蓝灰色）；
+    副标题为字号更小的斜体 serif / editorial italic。
+    {text_align_desc}，字号克制，留出充足呼吸空间，整体像艺术杂志排版而非商业广告文案。
+  none: ""
+
+figures_blocks:
+  "6_8": |
+    画面中加入 6-8 个极简黑色线条小人，各自的发型、高矮胖瘦、服装与性格必须互不相同，
+    小人是叙事的一部分而非装饰，不得密集堆叠，也不得遮挡或改变原照片中主体的位置与轮廓。
+  "0": ""
+
+variants:
+  - id: poster_gouache
+    name: 哑光水粉海报
+    source: 提示词16（完整版）
+    params: {render: gouache, aspect: "2:3", text_role: footer_editorial, text_align: left}
+  - id: poster_gouache_brief
+    name: 哑光水粉海报·简版
+    source: 提示词11
+    note: 提示词更短，用于省钱/快速草稿场景
+    params: {render: gouache, aspect: "2:3", text_role: footer_editorial}
+  - id: poster_ink_postcard
+    name: 水墨明信片
+    source: 提示词8 ≈ 提示词10b
+    params: {render: ink_wash, aspect: "3:4", text_role: footer_editorial, text_align: center, abstraction: mid}
+  - id: poster_pixel
+    name: 材料像素景观
+    source: 提示词13
+    params: {render: pixel, aspect: "3:4", palette_source: from_photo, text_role: none}
+  - id: poster_figures
+    name: 小人叙事海报
+    source: 提示词12
+    params: {render: line_figures, aspect: "3:4", figures: "6_8", text_role: none}

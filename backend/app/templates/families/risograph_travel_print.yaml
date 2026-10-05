@@ -1,0 +1,176 @@
+# 家族：Riso 旅行版画（照片 → 孔版印刷品）
+# ★ 本家族以用户实际工作流的 v5 产出为标准（不是 v9）。
+#   v5 的本质是「照片 → 孔版印刷品」：满幅细密半调网点、照片结构完整保留、
+#   只是换成了专色墨。它不是「照片 → 艺术化重绘」——那是 v9 和其他家族的事。
+# 校准基准：校园纪念馆项目/Riso记忆/projects/assets/ 下的 test_*_v5.jpg
+kind: family
+id: risograph_travel_print
+name: Riso 旅行版画
+icon: 🖨️
+description: 照片原样转译成孔版印刷海报——满幅细密半调网点、专色套印、纸白从缝隙透出，结构与细节完整保留
+layout: full
+default_aspect: origin       # ★ 跟随原图画幅 —— 对整张图生成，绝不裁切
+# 网点负责全画面的明暗，没有"插画区"和"实景区"之分，所以 forbid 作用于整张图
+forbid_scope: whole
+allow_change: [color, light, detail_density, text_add, material, edge]
+suitable:
+  - 城市建筑与街景
+  - 校园地标与纪念建筑
+  - 有清晰结构的风景
+  - 旅行纪念照
+
+# ── 硬禁止：无论参数怎么调都不许出现 ──────────────────
+hard_forbid:
+  - 平滑渐变与连续调照片质感
+  - 矢量扁平色块、插画化重绘
+  - 手绘笔触、水彩晕染、油画肌理
+  - 画面大面积空洞、主体消失
+  - 3D 效果、投影、立体样机
+  - 边框、撕纸边、拼贴拼合
+  - 刺眼的荧光色与廉价糖果色（不含原图主体本身的固有色）
+  - 水印、Logo、错别字
+
+# ── 可调参数：每一个都对应 v5 里看得见的差异 ─────────────
+params:
+  aspect:
+    type: enum
+    label: 画幅
+    options: ["origin", "3:4", "3:5"]
+    option_labels: {"origin": "跟随原图（整张图生成）", "3:4": "3:4 竖构图", "3:5": "3:5 竖构图"}
+    default: "origin"
+  palette_mode:
+    type: enum
+    label: 色彩方案
+    options: [from_photo, subject_original, monochrome_blue, warm_cool]
+    option_labels:
+      from_photo: 全画面取自原图
+      subject_original: 主体保原色
+      monochrome_blue: 单色蓝墨
+      warm_cool: 冷暖对撞
+    default: from_photo
+  dot_size:
+    type: enum
+    label: 网点粗细
+    options: [ultra_fine, fine, medium, coarse]
+    option_labels:
+      ultra_fine: 极细（近连续调）
+      fine: 细密
+      medium: 中等
+      coarse: 粗大
+    default: fine
+  coverage:
+    type: enum
+    label: 网点覆盖
+    options: [full, wide, balanced]
+    option_labels: {full: 满幅, wide: 大面积, balanced: 主体密·远景疏}
+    default: full
+  detail_fidelity:
+    type: enum
+    label: 细节保留度
+    options: [high, medium, low]
+    option_labels: {high: 高（砖缝可辨）, medium: 中, low: 低（大块概括）}
+    default: high
+  drum_banding:
+    type: enum
+    label: 滚筒条痕
+    options: [visible, subtle, none]
+    option_labels: {visible: 明显, subtle: 轻微, none: 无}
+    default: subtle
+  misregistration:
+    type: enum
+    label: 套印错位
+    options: [none, subtle, strong]
+    option_labels: {none: 无, subtle: 轻微, strong: 明显}
+    default: subtle
+  paper:
+    type: enum
+    label: 纸张
+    options: [warm_ivory, bright_white, kraft]
+    option_labels: {warm_ivory: 暖米白, bright_white: 冷白, kraft: 牛皮纸}
+    default: warm_ivory
+  text_role:
+    type: enum
+    label: 文字
+    options: [serif_caption, none]
+    option_labels: {serif_caption: 衬线短标, none: 不加文字}
+    default: serif_caption
+
+# ── 参数 → 具体技法描述（写进提示词的"操作级"内容）────────
+dicts:
+  palette_mode:
+    from_photo: 从原图提取最具代表性的 2–3 种颜色作为专色，其中必须包含一个深色（藏蓝/炭黑/深棕）承担线稿与暗部，以及一个暖色（红/橙/黄）承担焦点强调；全画面所有区域都用这套专色的网点表现
+    subject_original: 画面主体保留它原有的鲜艳色彩（接近原照片的色相与明度，但同样以网点呈现，不得变成平滑色块），其余区域只用两种专色——一个深色（藏蓝/炭黑/深棕）承担线稿与暗部，一个暖色（红/橙/黄）承担焦点与亮点
+    monochrome_blue: 仅用一种深蓝墨（藏蓝或普鲁士蓝），全画面单色孔版，靠网点密度完成全部明暗层次
+    warm_cool: 一冷一暖两色对撞（如藏蓝配橘红、青灰配暖黄），冷色承担结构与暗部，暖色承担焦点与光
+  dot_size:
+    ultra_fine: 极细密网点（约 150lpi），远看近乎连续调，凑近才见网点——这是最接近「照片只是换成了墨」的档位
+    fine: 细密网点（约 100lpi），网点清晰可辨但不干扰主体辨识
+    medium: 中等网点（约 65lpi），网点明显，具有清晰的手工印刷感
+    coarse: 粗大网点（约 45lpi），网点本身成为画面主角，强烈孔版质感
+  coverage:
+    full: 网点铺满全画面，纸白只从网点缝隙与高光处透出
+    wide: 大面积覆盖，仅天空、高光与远景保留成片纸白
+    balanced: 主体区网点密集，天空与远景保留约三成纸白，画面更透气
+  detail_fidelity:
+    high: 保留照片的全部结构细节——砖缝、窗框、栏杆铁艺、招牌文字都要能辨认，只是全部转译为网点
+    medium: 保留主体结构与中景细节，远景与次要元素简化为大块网点
+    low: 只保留大块明暗结构与主要轮廓，细节让位给网点肌理
+  drum_banding:
+    visible: 墨层带清晰的横向滚筒条痕，天空等大面积区域尤其明显，是画面质感的一部分
+    subtle: 墨层带轻微横向墨痕，凑近才可见
+    none: 墨层均匀，无条痕
+  misregistration:
+    none: 各色版严格对位，无错位
+    subtle: 若使用两种以上专色，暖色版相对深色版沿对角线偏移 1–2mm，色彩边缘出现细窄色晕（单色墨则无此效果）
+    strong: 若使用两种以上专色，各色版明显错位，色彩边缘出现 3–5mm 的色晕与重影（单色墨则无此效果）
+  paper:
+    warm_ivory: "暖米白纸（略带暖调，接近 #F3F0E8）"
+    bright_white: "冷白纸（接近 #FAFAF7）"
+    kraft: "牛皮纸（浅棕，接近 #E8DCC8）"
+
+# ── 三段式 ─────────────────────────────────────────
+segments:
+  preserve: |
+    严格保留原照片的完整构图：主体位置、地平线高度、建筑与景物的空间关系、透视与画面重心一概不变。
+    细节层级：{detail_fidelity_desc}。
+    原图的明暗分布与色彩关系照搬，只是「墨」换成了专色——这张图的辨识度来自结构，结构一丢就什么都不是了。
+
+  creative: |
+    把这张照片转译成一帧真正的孔版印刷（Risograph）海报。
+    整幅画面必须由半调网点构成，这是唯一正确的做法，不是修辞。
+    任何区域都不允许出现平滑渐变或实色色块，明暗过渡只能靠网点密度完成——
+    亮部网点稀疏到近乎消失、露出纸白，暗部网点密集到几乎连成实墨。
+    网点规格：{dot_size_desc}。
+    覆盖范围：{coverage_desc}。
+    色彩方案：{palette_mode_desc}。
+    各色版独立成层，{misregistration_desc}。
+    墨层质感：{drum_banding_desc}；墨色有深浅不均与局部积墨，绝不均匀平涂。
+    纸张：{paper_desc}，从网点缝隙与高光区透出，是画面的「第三种颜色」。
+    {text_block}
+
+  forbid: |
+    避免：{hard_forbid_joined}。
+    {dynamic_forbid}
+
+# ── 文本块 ─────────────────────────────────────────
+text_blocks:
+  serif_caption: |
+    在画面左下角放置一行小号衬线体全大写英文单词（1–2 个词，如 DUSK、GATE、BALLOONS），
+    用画面中最深的墨色，字号约为画面高度的 3–5%，
+    安静克制，像一枚档案标签而不是海报标题；不加阴影、不加描边、不加装饰。
+  none: ""
+
+# ── 预设变体（对齐 v5 的三张基准图）──────────────────
+variants:
+  - id: riso_gate
+    name: 单色蓝墨·建筑
+    source: test_gate_v5.jpg
+    params: {palette_mode: monochrome_blue, dot_size: ultra_fine, coverage: full, detail_fidelity: high, drum_banding: visible}
+  - id: riso_dusk
+    name: 三色·黄昏广场
+    source: test_plaza_v5.jpg
+    params: {palette_mode: warm_cool, dot_size: fine, coverage: full, detail_fidelity: medium, drum_banding: subtle}
+  - id: riso_balloons
+    name: 主体原色·气球
+    source: test_balloons_v5.jpg
+    params: {palette_mode: subject_original, dot_size: fine, coverage: wide, detail_fidelity: medium}

@@ -1,0 +1,20 @@
+/* 全局基础 —— 只放「骨架」，不放设计变量。
+   设计变量（纸色 / 墨色 / 语义色 / 字体栈）统一定义在 App.css 的 :root，
+   以前这里也抄了一份 --sans / --mono，而且 mono 的字体栈还和 App.css 不一致，
+   属于真源分裂：改一处忘一处，等宽字会在不同组件里长得不一样。 */
+
+:root {
+  color-scheme: light;
+}
+
+html, body, #root { height: 100%; }
+
+body {
+  margin: 0;
+  font: 14px/1.55 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+button, input, select, textarea { font-family: inherit; }
+
+code { font-family: var(--mono); }

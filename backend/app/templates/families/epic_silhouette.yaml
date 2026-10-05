@@ -1,0 +1,83 @@
+kind: family
+id: epic_silhouette
+name: 史诗剪影
+icon: 🏛️
+description: 巨大的人物侧脸剪影作为外轮廓，内部生长出与主题强绑定的完整世界观
+layout: full
+default_aspect: '3:4'
+forbid_scope: whole
+allow_change:
+- color
+- light
+- detail_density
+- background
+- text_add
+- material
+suitable:
+- 人物肖像照
+- 正脸或侧脸清晰的证件照式照片
+hard_forbid:
+- 改变人物本人的相貌与身份特征
+- 普通拼贴、硬拼贴、模板化背景、廉价奇幻素材
+- 杂乱堆砌、元素与主题无关
+- 商业广告感、Logo、长文字
+- 密集满铺、不留白
+params:
+  theme:
+    type: string
+    default: 校园与毕业
+  mood:
+    type: enum
+    options:
+    - nostalgic
+    - sacred
+    - poetic
+    - legendary
+    default: nostalgic
+  text_lang:
+    type: enum
+    options:
+    - en
+    - none
+    default: en
+dicts:
+  mood:
+    nostalgic: 安静、怀旧、诗意
+    sacred: 神圣、宏大、庄重
+    poetic: 诗意、轻盈、空气感
+    legendary: 传说感、史诗、命运感
+segments:
+  preserve: '基于人物肖像创作：确保人物本人的样貌不变——
+
+    剪影外轮廓取自照片中人物的侧脸或正脸特征（发际线、鼻梁、下颌线必须可认出是本人）。
+
+    '
+  creative: '收藏版史诗叙事海报：巨大的「{subject.name}」侧脸剪影作为外轮廓，
+
+    剪影内部自动生长出最契合主题「{theme}」的完整世界观——
+
+    标志性场景、角色关系、象征符号、关键建筑、生物与道具，全部元素强绑定主题、一眼识别。
+
+    整体不是分块拼贴，而是剪影轮廓填充式合成：场景生长在剪影内部，与轮廓共用同一条边界，不另加边框，
+
+    构图取电影海报式的大尺度居中剪影，笔触取水彩的湿接晕染与柔和边缘。
+
+    远景做空气透视（越远明度越高、饱和度越低）、轮廓处轻雾化过渡、纸张颗粒、边缘飞白与刷痕，留白占画面六成以上，文字只占一行且字高不超过画面高度的 3%，
+
+    情绪基调：{mood_desc}。
+
+    风格、色彩、场景、材质全部根据主题自动适配。
+
+    {text_block}
+
+    '
+  forbid: |
+    - 避免：{hard_forbid_joined}
+    - {dynamic_forbid}
+text_blocks:
+  en: '若有文字则使用英文，一行为限，安静置于留白处，字体克制。
+
+    '
+  none: ''
+not_suitable:
+- 非人物照片（本家族只做人像）

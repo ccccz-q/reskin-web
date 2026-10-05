@@ -1,0 +1,131 @@
+params:
+  aspect: 画幅
+  style: 风格
+  render: 风格化手法
+  fidelity: 保真强度
+  abstraction: 抽象度
+  resolution_hint: 输出清晰度
+  split_ratio: 分区比例
+  palette_source: 色板来源
+  fixed_palette: 指定色板
+  color_swatches: 附色卡
+  subject: 主体
+  school: 学校
+  major: 专业
+  direction: 方向
+  silhouette_side: 剪影朝向
+  inner_world: 内在世界
+  materialize_anchor: 物化锚点
+  object_form: 物化形态
+  interaction: 互动方式
+  giant_element: 巨物元素
+  flat_shapes: 平涂形状
+  small_elements: 小元素
+  detail_constraint: 细节约束
+  graffiti: 涂鸦
+  substrate: 纸张基底
+  tear_logic: 撕纸逻辑
+  photo_ratio: 照片占比
+  edge: 边缘处理
+  crossing_color: 跨越色
+  text_role: 文字用法
+  text_lang: 文字语种
+  text_align: 文字对齐
+  figures: 人物数量
+  theme: 主题世界观
+  figure_count: 小人数量
+  tone: 纸面底色
+  module_count: 模块上限
+  subject_share: 主体占比
+  brightness: 配色明度
+  mood: 情绪基调
+  layout_mode: 版式
+  anchor_num: 视觉锚点数
+options:
+  rembrandt_dark: 伦勃朗暗调
+  national_geo: 国家地理
+  cinematic_city: 电影感城市
+  fabric_thread: 织物纤维
+  travel_sketch: 旅行速写
+  cg_render: CG 渲染
+  pen_wash_journal: 钢笔淡彩手账
+  gouache: 水粉
+  ink_wash: 水墨
+  pixel: 像素
+  line_figures: 线描人物
+  editorial: 杂志质感
+  light: 轻度
+  medium: 中度
+  heavy: 重度
+  low: 低
+  mid: 中
+  high: 高
+  origin: 跟随原图
+  '1:1': 1:1 方构图
+  '1:1.2': 61.2
+  '2:3': 2:3 竖构图
+  '3:4': 3:4 竖构图
+  '3:5': 3:5 竖构图
+  warm_ivory: 暖米白
+  old_yellow: 旧黄纸
+  from_photo: 取自原图
+  fixed: 固定色板
+  en: 英文
+  zh: 中文
+  handwritten: 手写体
+  footer_editorial: 底部杂志体
+  micro_embroidery: 微观刺绣
+  micro_typewriter: 微缩打字机
+  left: 朝左
+  right: 朝右
+  center: 居中
+  front: 正面
+  hard: 硬边
+  bleed: 晕染外溢
+  contour: 沿轮廓撕
+  division: 沿分区撕
+  focal_window: 局部开窗
+by_param:
+  text_role:
+    none: 不加文字
+  substrate:
+    none: 无基底
+  resolution_hint:
+    none: 不指定
+    4K: 4K 高清
+    8K: 8K 超清
+  figures:
+    '0': 不要人物
+    '0_2': 0–2 人
+    '0_3': 0–3 人
+    '6_8': 6–8 人
+  tear_logic:
+    contour: 沿主体轮廓撕开
+    division: 沿上下分区撕开
+    focal_window: 画面局部开窗
+  epic_silhouette.mood:
+    nostalgic: 安静怀旧
+    sacred: 神圣宏大
+    poetic: 诗意轻盈
+    legendary: 传说史诗
+  epic_silhouette.text_lang:
+    none: 不加文字
+  doodle_narrators.tone:
+    warm_white: 暖白
+    cream: 奶油
+  doodle_narrators.figure_count:
+    '2': 2 个（极简）
+    '3': 3 个（推荐）
+    '4': 4 个
+    '5': 5 个
+    '7': 7 个（热闹）
+  material_pixel.module_count:
+    '120': 120 块（疏朗）
+    '160': 160 块（标准）
+    '200': 200 块（繁密）
+  material_pixel.brightness:
+    clear: 原照明快
+    brighter: 提亮通透
+  layout_mode:
+    fusion: 整幅融合（推荐）
+    split: 上下分版
