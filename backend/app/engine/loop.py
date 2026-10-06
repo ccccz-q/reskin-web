@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -470,30 +471,149 @@ def _fill_missing_tool_replies(messages: list[dict]) -> int:
     return filled
 
 
+# ── 长期记忆：摘要 + 结构化画像 ─────────────────────────────
+#
+# ★ prefs 为什么曾经永远是空 dict（2026-10-06 修复）
+# ------------------------------------------------------
+# 旧代码写着 `prefs = old.get("prefs") or {}` 再原样塞回 save_long_term ——
+# 读出来的旧值又被写回去，**全项目没有任何一处往里写过内容**。
+# 结果：这个字段从建表起就没被真正用起来过，L5 长期记忆层只吃到那一段
+# 自然语言摘要。这次让秘书模型同时产出结构化画像。
+#
+# ★ 三个纪律（违反任何一条，画像都会退化成噪声）
+#   ① **键必须收敛到白名单** —— 放任模型自由发挥，它每轮都能造一个新键，
+#      画像会无限膨胀到无法指导任何决策。
+#   ② **列表必须有上限** —— 「喜欢过 40 种风格」等于没有风格偏好。
+#   ③ **解析失败绝不能清空已有画像** —— 旧画像是资产，一次模型抽风不该抹掉它。
+
+_PREF_KEYS = ("喜欢的家族", "常用画幅", "偏好的氛围", "回避的元素")
+_PREF_LIST_CAP = 6          # 每个键最多保留几条
+_PREF_ITEM_CAP = 20         # 单条短语最长字符数
+
+_MEMORY_PROMPT = """把这段对话压缩成长期记忆，只输出一个 JSON 对象，不要任何解释或代码块标记：
+{"summary":"120 字以内的中文摘要，保留用户的风格偏好、已尝试的家族、用户的反馈",
+ "prefs":{"喜欢的家族":[],"常用画幅":[],"偏好的氛围":[],"回避的元素":[]}}
+
+prefs 的填写规则：
+- 四个键固定，不要新增、不要改名；没提到的就留空数组。
+- 只填用户**明确说过或反复使用**的，不要推测、不要脑补。填不出就留空。
+- 每项最多 3 条短语，每条不超过 10 个字。"""
+
+
+def _extract_json_object(text: str) -> dict | None:
+    """从秘书输出里抠出 JSON 对象 —— 模型常常自作主张裹一层 ```json 代码块"""
+    if not text:
+        return None
+    s = (text or "").strip()
+    if s.startswith("```"):
+        lines = [ln for ln in s.splitlines() if ln.strip()]
+        if lines and lines[0].strip().lower().lstrip("`") in ("json", "jsonc"):
+            lines = lines[1:]
+        s = "\n".join(lines).strip("`").strip()
+    start, end = s.find("{"), s.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        obj = json.loads(s[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _normalize_prefs(raw: object) -> dict:
+    """把模型给的任意结构收敛成 {白名单键: 短字符串列表}，脏数据一律丢掉"""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, list[str]] = {}
+    for key in _PREF_KEYS:
+        val = raw.get(key)
+        if isinstance(val, str):
+            items = [p.strip() for p in re.split(r"[、,，/;；]", val)]
+        elif isinstance(val, list):
+            items = [str(x).strip() for x in val]
+        else:
+            items = []
+        seen: set[str] = set()
+        uniq: list[str] = []
+        for it in items:
+            it = (it or "").strip()[:_PREF_ITEM_CAP]
+            if it and it not in seen:
+                seen.add(it)
+                uniq.append(it)
+        if uniq:
+            out[key] = uniq[:_PREF_LIST_CAP]
+    return out
+
+
+def _merge_prefs(old: dict, new: dict) -> dict:
+    """新偏好优先（最近一次说的算数），去重后截断
+
+    ★ 白名单外的旧键**原样保留**：历史数据里可能有今天 schema 不认识的键
+      （例如用户旧会话里的「喜欢的风格」），那是用户资产，不能因为改了
+      schema 就把它删掉 —— schema 迁移只做加法。
+    """
+    merged = dict(old or {})
+    for key, items in (new or {}).items():
+        prev = merged.get(key)
+        if isinstance(prev, list):
+            prev_list = [str(x) for x in prev]
+        elif prev:
+            prev_list = [str(prev)]
+        else:
+            prev_list = []
+        seen: set[str] = set()
+        combined: list[str] = []
+        for it in list(items) + prev_list:
+            it = (it or "").strip()
+            if it and it not in seen:
+                seen.add(it)
+                combined.append(it)
+        if combined:
+            merged[key] = combined[:_PREF_LIST_CAP]
+    return merged
+
+
 def _update_long_term(thread_id: str) -> None:
-    """压缩历史 + 抽取偏好 —— 用小模型秘书（reasoning_effort=none）
+    """压缩历史 + 抽取画像 —— 用小模型秘书（reasoning_effort=none）
+
+    ★ 摘要与画像走**同一次调用**：记忆更新跑在 `run()` 返回之前，是**阻塞**的，
+      拆成两次秘书调用等于让用户多等一倍时间（「秘书不该让人等」的同一纪律）。
+      代价是 prompt 要结构化输出，换来的是一次调用拿到两样东西。
 
     失败不影响主流程：记忆更新是「nice to have」，不该因为摘要失败让整轮对话失败。
     """
     try:
         from services.llm import secretary
-        from services.context_store import history, message_count, save_long_term
+        from services.context_store import history
 
         msgs = history(thread_id, limit=MEMORY_TRIGGER)
         text = "\n".join(
             f"{m.get('role')}: {(m.get('content') or '')[:200]}" for m in msgs
         )
-        summary = secretary([
-            {"role": "system", "content":
-             "把这段对话压缩成 120 字以内的中文摘要，保留：用户的风格偏好、"
-             "已经尝试过的家族、用户的反馈。只输出摘要本身。"},
+        old = context_store.load_long_term(thread_id)
+        old_prefs = old.get("prefs") or {}
+
+        raw = secretary([
+            {"role": "system", "content": _MEMORY_PROMPT},
             {"role": "user", "content": text[:4000]},
-        ], max_tokens=220)
+        ], max_tokens=420)
+        if not raw:
+            return
+
+        payload = _extract_json_object(raw)
+        if payload is None:
+            # ★ 降级但不静默：模型没按格式来，整段当摘要用（这就是旧行为），
+            #   已有画像**原样保留** —— 一次解析失败不该抹掉用户的画像资产。
+            logger.warning("长期记忆未按 JSON 返回（thread=%s），降级为纯摘要", thread_id)
+            summary, prefs = raw.strip(), old_prefs
+        else:
+            summary = str(payload.get("summary") or "").strip()
+            prefs = _merge_prefs(old_prefs, _normalize_prefs(payload.get("prefs")))
+
         if summary:
-            old = context_store.load_long_term(thread_id)
-            prefs = old.get("prefs") or {}
-            save_long_term(thread_id, summary, prefs)
-            logger.info("已更新会话 %s 的长期记忆（%d 字符）", thread_id, len(summary))
+            context_store.save_long_term(thread_id, summary, prefs)
+            logger.info("已更新会话 %s 的长期记忆（摘要 %d 字 / 画像 %d 键）",
+                        thread_id, len(summary), len(prefs))
     except Exception as e:                       # 记忆失败绝不能拖垮对话
         logger.warning("长期记忆更新跳过：%s", type(e).__name__)
 

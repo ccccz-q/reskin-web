@@ -207,6 +207,87 @@ check("LLM 失败不抛出", r8.stopped_reason == "llm_error", r8.stopped_reason
 check("回复里说明了失败", "模型调用失败" in r8.reply, repr(r8.reply[:40]))
 
 print()
+print("=== 9. 长期记忆：摘要 + 结构化画像 ===")
+# ★ 这一节专治「prefs 永远是空 dict」那个陈年空壳（2026-10-06 修复）：
+#   旧代码 `prefs = old.get("prefs")` 读出来又写回去，等于什么都没做，
+#   L5 长期记忆层实际上只吃到那一段自然语言摘要。
+
+xj = loop._extract_json_object
+check("裸 JSON 能解析", xj('{"summary":"a","prefs":{}}') == {"summary": "a", "prefs": {}})
+check("代码块包裹也能解析", xj('```json\n{"summary":"a"}\n```').get("summary") == "a")
+check("前后有废话也能抠出来", xj('这是摘要：{"summary":"a"} 完毕').get("summary") == "a")
+check("非法 JSON 返回 None", xj('我就不按格式来') is None)
+check("空输入返回 None", xj("") is None)
+check("JSON 数组不是对象", xj('[1,2,3]') is None)
+
+np_ = loop._normalize_prefs
+clean = np_({"喜欢的家族": ["小人国", "zine"], "常用画幅": "3:4、9:16",
+             "偏好的氛围": ["暖色"], "回避的元素": [], "乱加的键": ["x"]})
+check("键收敛到白名单", set(clean) <= set(loop._PREF_KEYS), str(sorted(clean)))
+check("字符串按顿号切开", clean.get("常用画幅") == ["3:4", "9:16"], str(clean.get("常用画幅")))
+check("空数组不进库", "回避的元素" not in clean)
+check("脏类型整体丢弃", np_([1, 2]) == {} and np_("hi") == {})
+check("重复项去重", np_({"喜欢的家族": ["小人国", "小人国"]})["喜欢的家族"] == ["小人国"])
+big = np_({"喜欢的家族": [f"风格{i}" for i in range(20)]})
+check("列表有上限", len(big["喜欢的家族"]) == loop._PREF_LIST_CAP,
+      f"{len(big['喜欢的家族'])} 条")
+
+mp = loop._merge_prefs
+merged = mp({"喜欢的家族": ["旧的"], "历史遗留键": ["保留我"]}, {"喜欢的家族": ["新的"]})
+check("新偏好排在前", merged["喜欢的家族"][0] == "新的", str(merged["喜欢的家族"]))
+check("旧偏好没被丢", "旧的" in merged["喜欢的家族"])
+check("★ 白名单外的旧键保留", merged.get("历史遗留键") == ["保留我"])
+
+# ── 端到端 ①：秘书按格式返回 JSON → 画像真的写进去了
+tid = "mem_json"
+cs.clear_thread(tid)
+check("初始画像为空", cs.load_long_term(tid)["prefs"] == {})
+
+calls = []
+
+
+def _sec_json(messages, max_tokens=300):
+    calls.append(messages[-1]["content"][:200])
+    return ('{"summary":"用户偏好暖色插画，反复用小人国家族",'
+            '"prefs":{"喜欢的家族":["小人国"],"偏好的氛围":["暖色"]}}')
+
+
+llm_mod.secretary = _sec_json
+loop._update_long_term(tid)
+lt = cs.load_long_term(tid)
+check("摘要入库", "小人国" in lt["summary"], repr(lt["summary"][:30]))
+check("★ 画像不再是空壳", lt["prefs"] != {}, str(lt["prefs"]))
+check("画像内容正确", lt["prefs"].get("喜欢的家族") == ["小人国"], str(lt["prefs"]))
+check("只调了一次秘书（摘要与画像合并）", len(calls) == 1, f"{len(calls)} 次")
+
+# ── 端到端 ②：秘书不按格式返回 → 降级为摘要，且**已有画像不能被抹掉**
+def _sec_plain(messages, max_tokens=300):
+    return "这是一段没有 JSON 的纯文本摘要"
+
+
+llm_mod.secretary = _sec_plain
+loop._update_long_term(tid)
+lt2 = cs.load_long_term(tid)
+check("纯文本降级为摘要", lt2["summary"] == "这是一段没有 JSON 的纯文本摘要",
+      repr(lt2["summary"]))
+check("★ 解析失败不清空已有画像", lt2["prefs"].get("喜欢的家族") == ["小人国"],
+      str(lt2["prefs"]))
+
+# ── 端到端 ③：秘书抛异常也不能拖垮调用方
+def _sec_boom(messages, max_tokens=300):
+    raise RuntimeError("上游炸了")
+
+
+llm_mod.secretary = _sec_boom
+try:
+    loop._update_long_term(tid)
+    check("秘书异常被吞掉，不向上抛", True)
+except Exception as e:                                              # noqa: BLE001
+    check("秘书异常被吞掉，不向上抛", False, repr(e))
+lt3 = cs.load_long_term(tid)
+check("异常后数据仍是上一版", lt3["summary"] == "这是一段没有 JSON 的纯文本摘要")
+
+print()
 print(f"结果：{PASS} 通过 / {FAIL} 失败")
 
 # ★ 必须用退出码报告失败 —— 只 print 不 exit 的话，

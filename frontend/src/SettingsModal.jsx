@@ -116,7 +116,14 @@ export default function SettingsModal({ onClose, flash, settings, onChange, stri
       const d = await api.authLogin(bindForm.username.trim(), bindForm.password)
       afterAuth(d.token, '登录成功，你的作品都在')
     } catch (e) {
-      flash?.(e.message || '登录没有成功，请核对后再试')
+      // ★ 忘密码必须有**看得见**的出路（2026-10-06）：后端早就提供了管理员重置
+      //   （POST /admin/users/reset-password），但用户不知道它存在的话，这个能力
+      //   等于没交付 —— 他会以为账号连同作品一起丢了。
+      //   所以这里把两条退路都讲明白：访客码当场自救，账号密码找站长。
+      const base = e.message || '登录没有成功，请核对用户名或密码'
+      flash?.(e.status === 401
+        ? `${base}。都想不起来的话，凭本页那串访客码也能找回作品；账号密码可以请站长在管理后台帮你重置。`
+        : base)
     } finally { setIdBusy(false) }
   }, [idBusy, bindForm, afterAuth, flash])
 
@@ -140,10 +147,36 @@ export default function SettingsModal({ onClose, flash, settings, onChange, stri
 
   const copyCode = useCallback(async () => {
     if (!me?.code) return
+    const code = me.code
+    // ★ 为什么要两道手段（2026-10-06）：`navigator.clipboard` 只在**安全上下文**
+    //   （HTTPS 或 localhost）里可用 —— 从手机访问 http://192.168.x.x:8000
+    //   这种局域网部署时它是 undefined，`writeText` 一并失败。
+    //   而访客码是「清了缓存之后唯一的救命稻草」：复制失败 + 用户没记下来
+    //   = 作品永久丢失。多花几行换来一条传统通道，这笔账很好算。
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(code)
+        flash?.('访客码已复制，建议粘贴保存到备忘录')
+        return
+      } catch { /* 落到下面的传统通道 */ }
+    }
     try {
-      await navigator.clipboard.writeText(me.code)
-      flash?.('访客码已复制')
-    } catch { flash?.(`访客码：${me.code}（请手动记录）`) }
+      const ta = document.createElement('textarea')
+      ta.value = code
+      ta.setAttribute('readonly', '')
+      ta.style.position = 'fixed'
+      ta.style.top = '-1000px'
+      ta.style.opacity = '0'
+      document.body.appendChild(ta)
+      ta.select()
+      const ok = document.execCommand('copy')
+      document.body.removeChild(ta)
+      if (ok) {
+        flash?.('访客码已复制，建议粘贴保存到备忘录')
+        return
+      }
+    } catch { /* 两条通道都不行，就把码给用户看 */ }
+    flash?.(`访客码：${code}（没能自动写入剪贴板，请务必手动记下来）`)
   }, [me, flash])
 
   const update = (patch) => {

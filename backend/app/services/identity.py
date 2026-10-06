@@ -210,6 +210,15 @@ def _ensure_tables() -> None:
                 created_at TEXT
             );
             """)
+            # ★ 列级迁移：老库是 CREATE TABLE IF NOT EXISTS 建出来的，
+            #   它**不会给已存在的表补新列** —— 不补的话下面所有涉及
+            #   pw_version 的 SQL 都会报 "no such column"。
+            #   报错已存在无所谓，正是幂等想要的结果。
+            try:
+                conn.execute(
+                    "ALTER TABLE users ADD COLUMN pw_version INTEGER DEFAULT 1")
+            except Exception:                                 # noqa: BLE001
+                pass                                          # 列已存在
             conn.commit()
         finally:
             conn.close()
@@ -354,6 +363,101 @@ def verify_login(username: str, password: str) -> str | None:
             conn.close()
 
 
+# ── 密码版本号：让「重置密码」真的能挡住人 ──────────────────────
+#
+# ★ 为什么必须有它（2026-10-06）：登录令牌 HMAC 签的内容是 sid + 有效期，
+#   **里面没有任何密码信息**。管理员替用户重置密码后，盗走令牌的人手上的凭证
+#   在 180 天有效期内照用不误 —— 那样「重置密码」形同虚设，
+#   只是在数据库里换了个哈希而已。
+#   版本号进签名之后：重置一次 +1，旧令牌当场验签失败。
+#
+# ★ 兼容怎么做的：旧令牌是三段 `sid.exp.sig`，隐含 ver=1。未被重置过的账号
+#   ver 就是 1，旧令牌照用（不会把所有人踢下线）；一旦重置过（ver≥2），
+#   旧格式令牌立即失效 —— 正好是想要的结果。
+
+_PW_VER_CACHE: dict[str, int] = {}
+
+
+def _pw_version(session_id: str) -> int:
+    """会话所属账号的密码版本号；未绑定账号恒为 1
+
+    进程内缓存避免每次验签都查库 —— 和 rate_limit 一个口径：本项目是单实例部署，
+    多实例场景下缓存会各自为政（那时应改为从共享存储读）。
+    """
+    cached = _PW_VER_CACHE.get(session_id)
+    if cached is not None:
+        return cached
+    ver = 1
+    try:
+        _ensure_tables()
+        from services import context_store as cs
+        with cs._db_lock:
+            conn = cs._connect()
+            try:
+                row = conn.execute(
+                    "SELECT pw_version FROM users WHERE session_id=?",
+                    (session_id,)).fetchone()
+                if row and row["pw_version"]:
+                    ver = int(row["pw_version"])
+            finally:
+                conn.close()
+    except Exception as e:                                    # noqa: BLE001
+        # 库忙 / 表还没准备好：按 1 处理，令牌照签发 —— 读不到版本号不该让用户登不进去
+        logger.warning("读取密码版本号失败（按 1 处理）：%s", type(e).__name__)
+    if len(_PW_VER_CACHE) > 4096:
+        _PW_VER_CACHE.clear()
+    _PW_VER_CACHE[session_id] = ver
+    return ver
+
+
+def admin_list_users(limit: int = 200) -> list[dict]:
+    """列出全部账号（脱敏，不含哈希）—— 管理员找回某个账号的检索入口"""
+    _ensure_tables()
+    from services import context_store as cs
+    with cs._db_lock:
+        conn = cs._connect()
+        try:
+            rows = conn.execute(
+                "SELECT username, hint, session_id, created_at FROM users "
+                "ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+        finally:
+            conn.close()
+    return [dict(r) for r in rows]
+
+
+def admin_reset_password(username: str, new_password: str) -> tuple[bool, str]:
+    """管理员强制重置某个账号的密码。成功返回 (True, '')，失败返回 (False, 原因)。
+
+    ★ 抬版本号这一步不能省：新哈希只拦得住「重新输密码」的人，
+      真正需要挡的是**手里已经攥着有效令牌**的那个人，而令牌不看密码。
+    """
+    name = (username or "").strip()
+    if len(new_password or "") < 6:
+        return False, "新密码至少 6 位"
+    _ensure_tables()
+    from services import context_store as cs
+    with cs._db_lock:
+        conn = cs._connect()
+        try:
+            row = conn.execute(
+                "SELECT session_id, pw_version FROM users WHERE username=?",
+                (name,)).fetchone()
+            if not row:
+                return False, "没有这个用户名，请核对后再试"
+            conn.execute(
+                "UPDATE users SET pw_hash=?, pw_version=? WHERE username=?",
+                (_hash_pw(new_password), int(row["pw_version"] or 1) + 1, name),
+            )
+            conn.commit()
+            # 让下一次查询读到新版本号 → 旧令牌验签失败
+            _PW_VER_CACHE.pop(row["session_id"], None)
+            audit("password_reset_by_admin", username=name[:40],
+                  session_id=row["session_id"])
+            return True, ""
+        finally:
+            conn.close()
+
+
 def account_of(session_id: str) -> dict | None:
     """会话 → 账号信息（脱敏，不含哈希）。未绑定返回 None。"""
     _ensure_tables()
@@ -406,24 +510,36 @@ TOKEN_TTL_SEC = _TOKEN_TTL_SEC
 
 
 def issue_token(session_id: str) -> str:
+    """签发令牌 `sid.ver.exp.sig` —— ver 是密码版本号（见 _pw_version 的注释）"""
     exp = int(time.time()) + _TOKEN_TTL_SEC
-    body = f"{session_id}.{exp}"
+    ver = _pw_version(session_id)
+    body = f"{session_id}.{ver}.{exp}"
     sig = hmac.new(_secret(), body.encode(), hashlib.sha256).hexdigest()
     return f"{body}.{sig}"
 
 
 def verify_token(token: str) -> str | None:
-    """令牌 → 会话 ID。无效/过期返回 None（调用方静默降级为访客态）。"""
+    """令牌 → 会话 ID。无效/过期/**密码已重置**返回 None（调用方静默降级为访客态）"""
     try:
         parts = token.split(".")
-        if len(parts) != 3:
+        if len(parts) == 3:
+            # 旧格式 sid.exp.sig：隐含 ver=1，签名体里也不带 ver
+            sid, exp, sig = parts
+            body = f"{sid}.{exp}"
+            if _pw_version(sid) != 1:
+                return None      # ★ 这个账号改过密码 → 旧令牌作废
+        elif len(parts) == 4:
+            sid, ver_s, exp, sig = parts
+            ver = int(ver_s)
+            if ver != _pw_version(sid):
+                return None      # ★ 同上，针对新格式令牌
+            body = f"{sid}.{ver}.{exp}"
+        else:
             return None
-        sid, exp, sig = parts
         if not sid or not exp or not sig:
             return None
         if int(exp) < time.time():
             return None
-        body = f"{sid}.{exp}"
         expect = hmac.new(_secret(), body.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig, expect):
             return None

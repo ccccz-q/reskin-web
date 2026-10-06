@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import sys
 import tempfile
 import time
@@ -152,6 +154,56 @@ check("default 视图看全部", all(
 vers = cs.list_forge(lineage="lin_o", owner=sid3)
 check("lineage 查询也按属主过滤", all(
     (r.get("owner_session") or "") != sid4 for r in vers))
+
+print("=== 9. 管理员重置密码 + 旧令牌吊销 ===")
+# ★ 背景：identity 的文件头从一开始就承诺「忘记密码由管理员后台重置」，
+#   但那个端点从未实现过 —— 用户忘密码又丢访客码就永久拿不回来。
+# ★ 更关键的一条：令牌签的是 sid + 有效期，**不含任何密码信息**。
+#   只改哈希不抬版本号的话，攥着旧令牌的人照样能进，重置等于白做。
+#   这一节就是钉死那一步的。
+
+sid_u = ident.new_session_id()
+check("绑定成功", ident.bind_account(sid_u, "重置测试户", "oldpw123", "测试")[0])
+check("旧密码能登录", ident.verify_login("重置测试户", "oldpw123") == sid_u)
+
+tok_old = ident.issue_token(sid_u)
+check("新令牌可用", ident.verify_token(tok_old) == sid_u)
+check("令牌是四段（含密码版本号）", len(tok_old.split(".")) == 4, tok_old.split(".")[1])
+
+users = ident.admin_list_users()
+names = [u["username"] for u in users]
+check("账号列表可见", "重置测试户" in names, str(names[:3]))
+check("★ 列表不含密码哈希", all("pw_hash" not in u for u in users))
+check("★ 列表只有脱敏字段",
+      all(set(u) <= {"username", "hint", "session_id", "created_at"} for u in users),
+      str(sorted(users[0].keys())) if users else "")
+
+check("用户名不存在时明确报错",
+      ident.admin_reset_password("查无此人", "newpw123")
+      == (False, "没有这个用户名，请核对后再试"))
+check("密码太短被拒",
+      ident.admin_reset_password("重置测试户", "123") == (False, "新密码至少 6 位"))
+# ★ 失败的尝试不能改坏任何东西
+check("失败尝试没有改动密码", ident.verify_login("重置测试户", "oldpw123") == sid_u)
+check("失败尝试没有吊销令牌", ident.verify_token(tok_old) == sid_u)
+
+ok9, why9 = ident.admin_reset_password("重置测试户", "newpw456")
+check("重置成功", ok9 and not why9, why9)
+check("新密码能登录", ident.verify_login("重置测试户", "newpw456") == sid_u)
+check("★ 旧密码已失效", ident.verify_login("重置测试户", "oldpw123") is None)
+check("★ 重置后旧令牌被吊销", ident.verify_token(tok_old) is None)
+check("重新登录能拿到可用令牌",
+      ident.verify_token(ident.issue_token(sid_u)) == sid_u)
+
+# 匿名会话没绑账号 → 版本号恒为 1，不该被任何人的改密码波及
+anon = ident.new_session_id()
+tok_a = ident.issue_token(anon)
+check("匿名会话令牌照常可用", ident.verify_token(tok_a) == anon)
+# 旧格式三段令牌（历史已发出）在账号没改过密码时仍然认
+tok_a_old = ".".join([anon, str(int(time.time()) + 3600),
+                      hmac.new(ident._secret(), f"{anon}.{int(time.time()) + 3600}"
+                               .encode(), hashlib.sha256).hexdigest()])
+check("旧格式三段令牌仍兼容", ident.verify_token(tok_a_old) == anon)
 
 print("=" * 46)
 print(f"结果：{PASS} 通过 / {FAIL} 失败")
