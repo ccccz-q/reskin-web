@@ -40,7 +40,11 @@ from config import MAX_AGENT_STEPS, MAX_TOOL_OBSERVATION_CHARS      # noqa: E402
 from contracts.tools import SPEND_TOOLS, TOOL_NAMES, openai_tools    # noqa: E402
 from infra.logging import audit, logger, step                        # noqa: E402
 from services import context_store                                   # noqa: E402
-from services.llm import LLMError, chat_with_tools                   # noqa: E402
+from services.llm import (                                        # noqa: E402
+    LLMError,
+    chat_with_tools,
+    summarize_for_final,
+)
 from tools.registry import ToolContext, dispatch, missing_implementations  # noqa: E402
 
 from .prompts import build_messages, build_system_prompt, compact_families_for_prompt  # noqa: E402
@@ -208,12 +212,33 @@ def run(
             emit("step", step=step_i, max_steps=MAX_AGENT_STEPS)
 
             try:
-                resp = chat_with_tools(
-                    messages,
-                    tools=[] if forced_final else tools_spec,
-                    tool_choice="none" if forced_final else "auto",
-                )
+                if forced_final:
+                    # ★ 2026-10-06：出图后的收尾文案改走 summarize_for_final。
+                    #   此前复用 chat_with_tools，继承了主循环的完整容错档位
+                    #   （主通道 60s×2 + 备通道 60s + 退避 ≈ 最坏 2 分 12 秒，
+                    #   实测用户确实卡了 2 分钟）。图已经生成好，这段文案
+                    #   不值这个等待 —— 不换通道、短超时、几乎不重试。
+                    resp = summarize_for_final(messages)
+                else:
+                    resp = chat_with_tools(
+                        messages,
+                        tools=tools_spec,
+                        tool_choice="auto",
+                    )
             except LLMError as e:
+                # ★ 2026-10-06 修正：收尾失败**不能**报成整轮失败。
+                #   图已经生成落盘了，用户手上就是成品 —— 缺的只是一段说明文字。
+                #   旧代码在此 break 走 llm_error，前端会显示「（模型调用失败）…」，
+                #   用户会以为这趟白跑了、甚至去重做一张。改成给一段兜底文案，
+                #   并明确告诉他图已经好了。
+                if forced_final:
+                    logger.warning("收尾文案生成失败（图已生成，仅缺说明文字）：%s", e)
+                    result.stopped_reason = "final_summary_failed"
+                    result.reply = "图已经生成好了。刚才没能写出这段说明，你可以直接看图——"\
+                                    "想换构图或配色的话，说一句就行。"
+                    audit("agent_final_summary_failed",
+                          thread_id=thread_id, error=str(e)[:200])
+                    break
                 logger.error("LLM 调用失败：%s", e)
                 emit("error", stage="llm", message=str(e)[:200])
                 result.stopped_reason = "llm_error"
@@ -358,7 +383,8 @@ def run(
                     "content": "（系统提示）请停止重复调用，直接用中文给这句任务一个简短结论。",
                 })
                 try:
-                    final = chat_with_tools(messages, tools=[], tool_choice="none")
+                    # ★ 2026-10-06：同 forced_final，收尾走快速总结（短超时不换通道）
+                    final = summarize_for_final(messages)
                     result.reply = (final.get("content") or "").strip() or (
                         "抱歉，这一步我没有得出可用的结论，换个说法或换张图再试试。"
                     )
@@ -374,7 +400,8 @@ def run(
                 "content": "（系统提示）已达最大步数，请直接用中文给出简短结论，不要再调用工具。",
             })
             try:
-                final = chat_with_tools(messages, tools=[], tool_choice="none")
+                # ★ 2026-10-06：同上，步数耗尽时的收尾也不再用完整重试档位
+                final = summarize_for_final(messages)
                 result.reply = (final.get("content") or "").strip() or (
                     "这一步走了太久，还没得出结果。可以更具体地说说你想要什么效果。"
                 )

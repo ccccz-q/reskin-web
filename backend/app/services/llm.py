@@ -918,6 +918,92 @@ def chat_with_tools(
     return _run_resilient(attempt, build_plan(channels), label="工具轮 LLM")
 
 
+# ── 收尾文案的「等待预算」三件套（2026-10-06）────────────────────────
+# 用户口径：**文案必须拿得到**，但**全程不许超过 1 分钟**。
+#   三个参数缺一不可 ——
+#     ATTEMPT  单次请求上限：比主链路 60s 短，超时早退才能留出重试余地
+#     TOTAL    总预算硬闸：不论重试几次，超过就立刻放弃（这是 1 分钟红线的执行者）
+#     PLAN     尝试次数 × 退避：给上游真实抖动留机会，而不是一撞就放弃
+FINAL_SUMMARY_ATTEMPT_TIMEOUT_SEC = int(os.getenv("FINAL_SUMMARY_ATTEMPT_TIMEOUT_SEC", "25"))
+FINAL_SUMMARY_TOTAL_BUDGET_SEC = int(os.getenv("FINAL_SUMMARY_TOTAL_BUDGET_SEC", "55"))
+_FINAL_SUMMARY_WAITS = (0.0, 1.5, 3.0)      # 3 次：0s / 1.5s / 3s（合计退避 4.5s）
+
+
+def summarize_for_final(messages: list[dict]) -> dict:
+    """**收尾总结专用**：不换通道、总预算封顶，但**给足 3 次机会**。
+
+    ★ 为什么要单独开一条（2026-10-06，用户实测「收尾文案 2 分钟」）：
+      收尾（出图成功后模型写一段说明）此前直接复用 `chat_with_tools`，
+      于是继承了 Agent 主循环的**完整容错档位**：
+
+        主通道 60s × timeout_budget=2 + 备通道(premium) 60s + 退避 6s ≈ 2 分 12 秒
+
+      但这一步的产物只是**一段说明文字** —— 图早就生成好了，用户已拿到成品。
+      为一段锦上添花的文案付两分钟，是把「主链路的容错」用错了地方。
+
+      对照 `secretary()` 早就想明白了（「秘书不该让人等」）——收尾是同一类，漏了。
+
+    ★ 参数怎么定的（用户明确要求：保证拿到文案，且总时长 < 1 分钟）：
+      不是简单砍到「一撞就放弃」—— 那样上游轻微抖动时文案直接没了，体验更差。
+      而是**在 1 分钟预算内尽量多给机会**：
+        3 次尝试（0s / 1.5s / 3s 退避），单次 25s，
+        总预算 55s 硬闸 —— 最坏 25+1.5+25 = 51.5s，留几秒余量。
+      典型情况（上游正常）首次即中，约 3–8s，与之前无感。
+
+    ★ 不换通道：备通道是 premium（更贵更强），收尾文案用不上；
+      出图成功那一刻用户要的是「马上看到说明」，不是「更强的一版说明」。
+
+    ★ 失败一律不抛给用户：调用方 loop.py 有兜底文案（图已生成，不该因文案失败而报整轮失败）。
+    """
+    ch = _DEEPSEEK_CH
+    if not _usable(ch):
+        raise LLMError("没有可用的文本模型通道（请检查 DEEPSEEK_* 配置）")
+
+    def attempt(c: _Channel) -> dict:
+        try:
+            cli = _client_for(c, FINAL_SUMMARY_ATTEMPT_TIMEOUT_SEC, 0)
+            resp = cli.chat.completions.create(
+                model=c.model,
+                messages=messages,
+                tools=[],
+                tool_choice="none",
+                temperature=0.2,
+            )
+        except Exception as e:
+            saved = _recover_from_exception(e)
+            if saved:
+                return {"content": saved, "tool_calls": [], "usage": {},
+                        "finish_reason": "stop", "_recovered": True}
+            raise LLMError(f"{type(e).__name__}: {e}") from e
+
+        msg = _message_from(resp)
+        content = _content_of(msg)
+        if not content.strip():
+            raise _empty_error(resp)
+        return {"content": content, "tool_calls": [], "usage": {},
+                "finish_reason": "stop"}
+
+    # 计划按总预算截断：万一配置被人调大，也不会突破 1 分钟红线
+    plan: list[tuple[_Channel, float]] = []
+    elapsed = 0.0
+    for w in _FINAL_SUMMARY_WAITS:
+        if elapsed + FINAL_SUMMARY_ATTEMPT_TIMEOUT_SEC > FINAL_SUMMARY_TOTAL_BUDGET_SEC:
+            logger.warning("收尾总结预算已用尽（%ds/%ds），剩余机会跳过",
+                           int(elapsed), FINAL_SUMMARY_TOTAL_BUDGET_SEC)
+            break
+        plan.append((ch, w))
+        elapsed += w + FINAL_SUMMARY_ATTEMPT_TIMEOUT_SEC
+    if not plan:                      # 预算被配得极小：至少给一次机会
+        plan = [(ch, 0.0)]
+
+    # timeout_budget 宽松（等于尝试次数）：超时也允许再试 ——
+    #   与主链路「超时不重试」相反，因为这里有总预算硬闸兜着，
+    #   多试一次的代价可控，而放弃的代价是用户拿不到文案。
+    return _run_resilient(attempt, plan, label="收尾总结",
+                          timeout_budget=len(plan))
+    return _run_resilient(attempt, plan, label="收尾总结", timeout_budget=1)
+
+
 def secretary(messages: list[dict], max_tokens: int = 300) -> str:
     """小模型秘书：复用主接入点 + 关掉思考
 
