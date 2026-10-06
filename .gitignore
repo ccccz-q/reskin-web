@@ -22,6 +22,10 @@ backend/storage/
 logs/
 *.log
 
+# 测试跑出来的临时图片（跑一次 tests/run_all.py 就会生成几十张）
+# ★ 与私库保持同一条规则：漏了它，一次测试就会把几十张图混进下次提交。
+backend/tests/_img_tmp/
+
 # 历史遗留：LangGraph 的 SqliteSaver 曾在这里留下一个 678MB 的 agent.db，
 # 这类「运行时数据库」本来就不该跟着项目走。
 *.db

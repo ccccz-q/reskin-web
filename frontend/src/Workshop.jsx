@@ -363,7 +363,16 @@ export default function Workshop({ onClose, onInstalled, flash }) {
     setInstalling(true)
     try {
       const r = await api.forgeInstall(current.id)
-      flash?.(`已安装「${r.family_id}」，可以在左侧家族列表里用了`)
+      // ★ 2026-10-06：后端现在会带回 QC 警告与安装期问题（此前算完就丢）。
+      //   这里合并成一条完整提示 —— 只报成功会让用户以为一切正常，
+      //   而「这个家族有隐患」「下次迭代会带缺陷回来」恰恰是最该说的。
+      const notes = [
+        ...(r.qc_warnings || []),
+        ...(r.warnings || []),
+      ].filter(Boolean)
+      flash?.(notes.length
+        ? `已安装「${r.family_id}」，但有 ${notes.length} 处需要注意：${notes.join('；')}`
+        : `已安装「${r.family_id}」，可以在左侧家族列表里用了`)
       onInstalled?.()
       refreshLibrary()
     } catch (e) {

@@ -69,15 +69,30 @@ _RUNTIME_DIR = Path(TEMPLATES_DIR) / "families"
 
 
 def _resolve_images(urls: list[str]) -> list[str]:
-    """URL → 本地绝对路径。非法的一律跳过（不让用户输入带偏整条链）"""
+    """URL → 本地绝对路径。非法的一律跳过（不让用户输入带偏整条链）
+
+    ★ 2026-10-06：跳过本身是对的（normalize_reference 抛的是 AgentInputError，
+      属用户输入问题，不该让整条链崩），但**静默**跳过不行 ——
+      用户贴 5 张、其中 3 张路径非法，他只会觉得「怎么提炼质量这么差」，
+      而永远不知道有 3 张根本没进来。这里补日志，至少可追溯。
+    """
     out = []
+    skipped = 0
     for u in urls or []:
         try:
             p = normalize_reference(u)
-        except Exception:
+        except Exception as e:
+            skipped += 1
+            logger.warning("参考图被跳过（非法地址 %r）：%s", str(u)[:80], e)
             continue
         if p and os.path.exists(p):
             out.append(p)
+        else:
+            skipped += 1
+            logger.warning("参考图被跳过（文件不存在 %r）", str(u)[:80])
+    if skipped:
+        logger.info("参考图 %d/%d 张不可用，本次提炼基于 %d 张进行",
+                    skipped, len(urls or []), len(out))
     return out
 
 
@@ -128,14 +143,32 @@ class PromptOverrideRequest(BaseModel):
     prompt: str = Field("", max_length=16000)
 
 
-def _resolve_base(base_family_id: str):
+def _resolve_base(base_family_id: str) -> tuple[dict | None, str]:
+    """按 id 取基础家族。返回 (家族 or None, 告警文案)
+
+    ★ 2026-10-06 修复：原来这里 `except Exception: return None`，
+      等于把「用户选的基础风格读不出来」伪装成「用户没选基础风格」。
+      后果是双重的 ——
+        ① 用户明明点了「基于《赛博像素》，提炼结果完全不像；
+        ② 更坏的是模板目录整个坏了（TEMPLATES_DIR 不存在 → TemplateError），
+           这里照样返回 None，用户只会看到「提炼结果不对」，
+           而真正的根因（模板层崩了）被这一行永久藏起来。
+      load_documents 本身是逐文件隔离的，坏文件不会连坐；
+      所以这里抛出来的只可能是「目录级」故障 —— 那必须让用户和运维看见。
+    """
     if not base_family_id:
-        return None
+        return None, ""
+    from services.template_manager import get_family_by_id
     try:
-        from services.template_manager import get_family_by_id
-        return get_family_by_id(base_family_id)
-    except Exception:
-        return None
+        fam = get_family_by_id(base_family_id)
+    except Exception as e:
+        return None, (f"基础风格模板读取失败（{type(e).__name__}: {e}）——"
+                      f"本次提炼**没有**基于「{base_family_id}」进行，"
+                      f"结果会与它无关。若这是持续故障，请联系维护者。")
+    if fam is None:
+        return None, (f"基础风格「{base_family_id}」不存在（可能已删除或改名）——"
+                      f"本次提炼按**无基础风格**进行。")
+    return fam, ""
 
 
 def _forge_and_save(req: DraftRequest, progress=None,
@@ -146,16 +179,25 @@ def _forge_and_save(req: DraftRequest, progress=None,
     owner：属主会话（公开版）；空=本地 default 模式，不写属主。
     """
     paths = _resolve_images(req.image_urls)
-    base = _resolve_base(req.base_family_id)
+    base, base_warn = _resolve_base(req.base_family_id)
 
     if not paths and not req.theory.strip():
         return {"ok": False, "error": "no_input",
                 "message": "至少上传一张参考图（推荐同类型 3–6 张）；风格理论可选。"}
 
+    # ★ 2026-10-06 新增：基础风格没读到就先说清楚，别让用户拿到一份
+    #   「完全不像我选的那个模板」的结果还找不到原因。
+    if base_warn:
+        logger.warning("基础风格未生效（%s）：%s", req.base_family_id, base_warn)
+
     # 提炼阶段用 VLM：这是「从图里看出风格」的核心，值得花这一次调用
     result = do_forge(req.theory, paths, req.user_notes, base, True,
                       style_prompt=req.style_prompt, progress=progress,
                       cancelled=cancelled)
+
+    # ★ base_warn 挂到 result 上（do_forge 可能自己已塞 warnings，所以用 insert 不覆盖）
+    if base_warn:
+        result.setdefault("warnings", []).insert(0, base_warn)
 
     # ★ 用户中止：不入库、不渲染，直接把 cancelled 标记带回给任务层
     if result.get("cancelled"):
@@ -406,10 +448,17 @@ async def revise_draft(req: ReviseRequest, sid: str = Depends(session_dep)):
         return {**res, "kept_version": row["version"], "kept_id": row["id"]}
 
     prompt = ""
+    render_warn = ""
     try:
         prompt = _render_prompt(res["spec"])
     except Exception as e:
-        logger.warning("草稿渲染失败（草稿仍会保存）：%s", e)
+        # ★ 2026-10-06 修复：draft 路径（_forge_and_save）会把渲染失败写进
+        #   warnings 返回给用户，revise 路径却只打了条日志。后果是用户点完
+        #   「迭代一版」，看到新版本里提示词一栏是空的，却完全不知道原因，
+        #   只能以为「模型这次没写提示词」。两处行为必须一致。
+        logger.warning("迭代版渲染失败（版本仍会保存）：%s", e)
+        render_warn = f"这一版渲染成提示词时失败（{type(e).__name__}）——" \
+                      f"版本已保存，但生成时会退回自动渲染。"
 
     # 同一条迭代链，版本号 +1（★ 参考图随本轮更新：贴了理想图后，
     # 这条迭代链的 images 就延续为理想图，后续迭代继续参照它）
@@ -423,7 +472,7 @@ async def revise_draft(req: ReviseRequest, sid: str = Depends(session_dep)):
         owner_session=(row.get("owner_session") or "").strip() or None,
     )
     audit("forge_saved", forge_id=new_id, lineage=row["lineage"], version=version)
-    return {
+    out = {
         **res,
         "id": new_id,
         "lineage": row["lineage"],
@@ -431,6 +480,10 @@ async def revise_draft(req: ReviseRequest, sid: str = Depends(session_dep)):
         "prompt": prompt,
         "previous_id": row["id"],
     }
+    # ★ 2026-10-06 新增：把渲染失败如实告知（追加，不覆盖模型自己给的 warnings）
+    if render_warn:
+        out["warnings"] = [*(res.get("warnings") or []), render_warn][:4]
+    return out
 
 
 @router.get("/library", summary="我的模板库")
@@ -538,7 +591,11 @@ async def install(forge_id: str, sid: str = Depends(session_dep)):
 
     # ★ 出厂检验（10-03 新增，语义级）：画幅/正向短语存活/forbid↔creative 矛盾。
     #   结构体检拦不住的「装得上、出图才炸」缺陷在这里拦下；自动修的当场修。
+    # ★ 2026-10-06 修复：qc_warnings 原来只在异常分支被赋空，正常分支算出来的
+    #   警告从来没进过返回值 —— 也就是说 QC 辛辛苦苦提的「这个家族有隐患」
+    #   全部丢弃，用户装完什么都不知道。这里补上返回。
     qc_fixed: list[str] = []
+    qc_warnings: list[str] = []
     try:
         from services.family_qc import qc_family
         spec, qc_blockers, qc_warnings, qc_fixed = qc_family(spec, card=row.get("card") or {})
@@ -550,8 +607,10 @@ async def install(forge_id: str, sid: str = Depends(session_dep)):
     except HTTPException:
         raise
     except Exception as e:                 # QC 自身故障不拦死安装（结构与渲染冒烟仍兜底）
+        # ★ 但「检验没做」这件事必须让用户知道 —— 否则他会以为检验通过了。
         logger.warning("出厂检验异常，跳过：%s", e)
-        qc_warnings = []
+        qc_warnings = [f"出厂检验未能执行（{type(e).__name__}），本次安装跳过了语义检查"]
+        audit("forge_qc_skipped", forge_id=forge_id, error=str(e)[:200])
 
     fid = str(spec.get("id") or "")
     if not fid:
@@ -602,6 +661,10 @@ async def install(forge_id: str, sid: str = Depends(session_dep)):
     #   否则下一版会把同一批结构缺陷重新带回来。
     #   prompt_override 必须带上：save_forge 是 INSERT OR REPLACE，
     #   不带就会把用户刚存的手改提示词抹掉（实测级边界）。
+    # ★ 2026-10-06：失败不再只进日志。原注释写「不影响安装」——安装确实成了，
+    #   但**库里仍是脏 spec**，用户下次点「迭代一版」会把同一批缺陷原样带回来，
+    #   而他完全不知道。这个代价必须让他看见。
+    install_warnings: list[str] = []
     try:
         context_store.save_forge(
             lineage=row["lineage"], version=int(row["version"] or 1),
@@ -615,7 +678,11 @@ async def install(forge_id: str, sid: str = Depends(session_dep)):
             owner_session=(row.get("owner_session") or "").strip() or None,
         )
     except Exception as e:
-        logger.warning("修复版 spec 回写失败（不影响安装）：%s", e)
+        logger.error("修复版 spec 回写失败（安装已成，但库记录仍是旧的）：%s", e)
+        audit("forge_writeback_failed", forge_id=forge_id, error=str(e)[:200])
+        install_warnings.append(
+            "家族已装好，但修复后的版本没能存回模板库——"
+            "下次「迭代一版」会基于修复前的版本继续，个别问题可能重现。")
 
     context_store.mark_forge_installed(forge_id, fid)
 
@@ -626,11 +693,15 @@ async def install(forge_id: str, sid: str = Depends(session_dep)):
                                       str(spec.get("name") or fid))
     except Exception as e:
         logger.warning("同步库名称失败（不影响安装）：%s", e)
+        install_warnings.append("库里的风格名没能同步成家族名，可能与模板列表对不上。")
 
     audit("forge_installed", forge_id=forge_id, family_id=fid)
     logger.info("已安装家族 %s（%s）", fid, ", ".join(written))
     return {"ok": True, "family_id": fid, "written": written,
             "repair_notes": (repair_notes + qc_fixed)[:10],
+            # ★ 2026-10-06 新增：QC 警告 + 安装期的次要问题一并返回（此前算完就丢）
+            "qc_warnings": list(qc_warnings)[:6],
+            "warnings": install_warnings,
             "prompt": prompt,
             "note": "已写入规格层与运行时层，sync_families.py --check 仍会通过。"}
 

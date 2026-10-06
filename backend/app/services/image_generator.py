@@ -283,12 +283,19 @@ def pick_size_for_image(reference_image_path: str, default: str = MIN_SAFE_TIER)
     """按原图分辨率决定输出档位，遵守「输出尺寸跟随原图」原则
 
     读不到尺寸时返回 default，不静默写死。
+
+    ★ 2026-10-06：降级本身合理（读不到尺寸总得选一档），但必须留痕 ——
+      否则「读不到尺寸」和「原图就是小图」在下游完全同形，用户拿到 2k 却
+      不知道是原图小还是文件坏了。补一条日志让排障可追溯。
     """
     try:
         from PIL import Image                     # 延迟导入：只有真要读尺寸时才依赖 Pillow
         with Image.open(reference_image_path) as im:
             w, h = im.size
-    except Exception:
+    except Exception as e:
+        logger.warning("读不到原图尺寸（%s：%s），回落到档位 %s",
+                       os.path.basename(reference_image_path or ""),
+                       type(e).__name__, default)
         return default
 
     longest = max(w, h)
@@ -378,12 +385,19 @@ def _is_policy_image_error(e: Exception) -> bool:
     """命中上游内容策略 —— 重试无效，必须早退 + 给用户可执行的话
 
     口径同样复用 services/llm（避免又出现两份各写一半的表）。
+
+    ★ 2026-10-06 补日志：这里原来是裸 `except Exception: return False`。
+      代价不对称 —— 判定失败返回 False，意味着**内容策略拦截会被当成普通
+      瞬时错误继续重试**，白烧用户的钱（本该一撞就退）。
+      结论仍然保守（False = 继续走重试），但必须留痕。
     """
     from services.llm import looks_like_policy_error
 
     try:
         return bool(looks_like_policy_error(e))
-    except Exception:
+    except Exception as be:                       # noqa: BLE001
+        logger.warning("内容策略判定失败，按「非策略拦截」处理（会继续重试）：%s",
+                       type(be).__name__)
         return False
 
 
@@ -476,7 +490,11 @@ def choose_oai_size(reference_image_path: str, aspect: str | None,
         with Image.open(reference_image_path) as im:
             w, h = im.size
         origin = "1024x1536" if h > w else ("1536x1024" if w > h else "1024x1024")
-    except Exception:                          # 读不到尺寸就用方图，不猜
+    except Exception as e:                          # 读不到尺寸就用方图，不猜
+        # ★ 2026-10-06 补日志：方图是保底选择，但「读不到原图」这件事
+        #   不能无声无息 —— 否则竖图用户拿到方图只会觉得「构图怎么被改了」。
+        logger.warning("读不到原图尺寸（%s：%s），按方图输出",
+                       os.path.basename(reference_image_path or ""), type(e).__name__)
         return "1024x1024"
 
     spec = str(aspect or "").strip()
@@ -749,7 +767,7 @@ def generate_image_with_reference(
 
     resolved = resolve_size(reference_image_path, size, aspect, aspect_wins)
 
-    # ── OpenAI images 后端（images/edits + images/generations）─────
+    # ── OpenAI images 后端（gpt-image-2 @ xbcl.link）─────────────
     # images/edits（带参考图，multipart），返回 b64_json，直接落盘不走 URL 下载
     # —— 原 SSRF 护栏（host 白名单等）只对"远端给 URL 再去下载"的模式有意义，
     #    b64 模式下内容不落地网络请求，天然没有这条通道。
