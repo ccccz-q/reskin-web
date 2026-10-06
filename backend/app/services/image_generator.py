@@ -163,7 +163,7 @@ def assert_provider_image_url(url: str) -> None:
 
     ★ 为什么必须分开（2026-10-05 实测踩坑）：
       换到 image2 原生分组后，上游不再返回 base64，改成返回
-      `data[0].url = https://cdn.jd23kjs.work/...`。
+      `data[0].url = https://<供应商-CDN-域名>/...`。
       如果沿用客户端那套白名单，就得把中转站的 CDN 域名硬编码进去 ——
       而 CDN 域名会变、白名单一漏就是内网直连（SSRF）。
       实际上这里的威胁模型不一样：这个 URL 是**我们自己信任的供应商**返回的
@@ -615,7 +615,7 @@ def _extract_image_bytes(resp: Any, model_name: str) -> tuple[bytes | None, str,
 
     ① data[0].b64_json —— 官方 OpenAI 形态，一直都是这条
     ② data[0].url      —— 2026-10-05 实测：换到「image2 原生分组」后
-       上游改成了这条（https://cdn.jd23kjs.work/...，18.8s 就出图）。
+       上游改成了这条（https://<供应商-CDN-域名>/...，18.8s 就出图）。
        旧代码只认 ①，于是「图已经生成好」被我们判成失败 ——
        上游改协议而我们不跟，是最容易被误判成「服务坏了」的一类故障。
 
@@ -849,7 +849,7 @@ def generate_image_with_reference(
             # ★ 上游有两种回图形态，两种都得认（2026-10-05 实测）：
             #   ① data[0].b64_json —— 官方 OpenAI 形态（我们一直是这条）
             #   ② data[0].url      —— 换到 image2 原生分组后**改成了这条**
-            #      （实测 https://cdn.jd23kjs.work/...，18.8s 就出图）
+            #      （实测 https://<供应商-CDN-域名>/...，18.8s 就出图）
             #   之前只认 ①，于是图明明生成了，却被判成"没有 b64_json"直接失败 ——
             #   典型的「上游改协议、我们不跟」造成的假故障。判定见 _extract_image_bytes。
             content, ctype, raw_reason = _extract_image_bytes(resp, used_model)

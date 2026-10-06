@@ -3,7 +3,7 @@
 事故经过（2026-10-05，用户实测报错「gpt-image 返回里没有 b64_json」）：
     用户在中转站把 image 通道换到「image2 原生分组」。换组后上游**不再返回
     base64**，改成返回图片 URL：
-        data[0] = {"url": "https://cdn.jd23kjs.work/images/.../xxx.png"}
+        data[0] = {"url": "https://<供应商-CDN-域名>/images/.../xxx.png"}
     而我们的代码只认 `b64_json` —— 图其实 18.8s 就生成了，却被我们判成失败。
     典型的「上游改协议、我们不跟」造成的假故障。
 
@@ -118,14 +118,17 @@ except ValueError as e:
     check("客户端 URL：白名单内放行", False, str(e)[:60])
 
 # 上游 URL：只看「是不是内网」，不看域名白名单
+# ★ 这里故意用 www.example.com（IANA 保留的文档域名）：
+#   判据本来就"不认域名"，用谁的都行；用真实供应商域名反而像是把 CDN 地址硬编码进了代码。
+#   注意它必须能解析 —— 判据会真的做 DNS 解析，换成不存在的域名这条用例会假失败。
 try:
-    ig.assert_provider_image_url("https://cdn.jd23kjs.work/a.png")
+    ig.assert_provider_image_url("https://www.example.com/a.png")
     check("上游 URL：公网 CDN 放行（无需硬编码域名）", True)
 except ValueError as e:
     check("上游 URL：公网 CDN 放行（无需硬编码域名）", False, str(e)[:80])
 
 for bad, why in [
-    ("http://cdn.jd23kjs.work/a.png", "明文 http"),
+    ("http://www.example.com/a.png", "明文 http"),
     ("https://127.0.0.1/a.png", "回环地址"),
     ("https://localhost/a.png", "localhost"),
     ("https://10.0.0.5/a.png", "内网 10 段"),
