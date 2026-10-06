@@ -29,7 +29,11 @@ from config import (                                    # noqa: E402
 # 被用来临时 new 一个 OpenAI 客户端看图；现在统一由 services/llm.vision()
 # 按通道配置取用（见 llm.py 顶部「通道」一节），本文件不再重复接线。
 from infra.logging import audit, logger                 # noqa: E402
-from services.llm import chat, extract_json             # noqa: E402   ★ extract_json 在 llm 里
+from services.llm import (                              # noqa: E402
+    chat,
+    chat_interactive,
+    extract_json,
+)   # ★ extract_json 在 llm 里
 from services.template_manager import load_families     # noqa: E402
 
 router = APIRouter(prefix="/api/helper", tags=["helper"])
@@ -300,8 +304,12 @@ async def helper_chat(req: HelperChatRequest) -> dict:
 
     system_with_ctx = system + vision_ctx
     try:
-        reply = chat([{"role": "system", "content": system_with_ctx}, *history],
-                     temperature=0.4, max_tokens=500)
+        # ★ 2026-10-06：改走 chat_interactive（总预算 60s + 空响应立刻换通道）。
+        #   原先用 chat() 等于套了批量流水线的档位（单次 180s、主通道排 3 次），
+        #   实测一次问答烧到 30.8s，其中 12s 花在明知会空的重试上。
+        reply = chat_interactive(
+            [{"role": "system", "content": system_with_ctx}, *history],
+            temperature=0.4, max_tokens=500)
         audit("helper_chat", with_image=with_image, model=DEEPSEEK_MODEL)
         return {"ok": True, "reply": (reply or "").strip(),
                 "model": DEEPSEEK_MODEL, "with_image": with_image}
@@ -336,12 +344,13 @@ def _analyze_image(path: str) -> tuple[dict, bool]:
 
     if not VISION_MODEL:
         try:
-            raw = chat([{"role": "system", "content": _ADVISOR_SYSTEM},
-                        {"role": "user", "content": json.dumps(
-                            {**payload, "note": "（未能看到图片，请仅依据清单给出通用建议）"},
-                            ensure_ascii=False)}],
-                       temperature=0.4, max_tokens=700,
-                       response_format={"type": "json_object"})
+            raw = chat_interactive(
+                [{"role": "system", "content": _ADVISOR_SYSTEM},
+                 {"role": "user", "content": json.dumps(
+                     {**payload, "note": "（未能看到图片，请仅依据清单给出通用建议）"},
+                     ensure_ascii=False)}],
+                temperature=0.4, max_tokens=700,
+                response_format={"type": "json_object"})
             return extract_json(raw) or {}, True
         except Exception as e:
             logger.warning("小助手降级推荐失败：%s", e)
@@ -356,7 +365,7 @@ def _analyze_image(path: str) -> tuple[dict, bool]:
         return {}, True
 
     # ★ 与 card_extractor / style_forge 共用同一份看图容错（services/llm.vision）
-    from services.llm import vision
+    from services.llm import HELPER_VISION_TIMEOUT_SEC, vision
 
     content = [
         {"type": "text", "text": _ADVISOR_SYSTEM + "\n\n家族清单：\n"
@@ -364,11 +373,15 @@ def _analyze_image(path: str) -> tuple[dict, bool]:
         {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
     ]
     try:
+        # ★ 2026-10-06：看图也按「人等得住」定档。vision 默认用全局
+        #   REQUEST_TIMEOUT_SEC=180s，超时最多试 2 次 —— 最坏 6 分钟，
+        #   那是给批量提炼定的。实测一次看图约 7s，30s 已是 4 倍余量。
         got = extract_json(vision(
             [{"role": "user", "content": content}],
             max_tokens=900,
             temperature=0.4,
             response_format={"type": "json_object"},
+            timeout=HELPER_VISION_TIMEOUT_SEC,
         )) or {}
     except Exception as e:
         logger.warning("小助手看图失败：%s", e)

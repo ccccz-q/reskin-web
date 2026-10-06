@@ -260,10 +260,16 @@ try:
     })
     out = llm.chat([{"role": "user", "content": "hi"}])
     check("换通道后成功拿到内容", out == "来自 premium", out)
-    check("确实试到主通道位置", rec.seen.count("deepseek") == 3, str(rec.seen))
+    # ★ 2026-10-06 行为变更：主通道原本会排满 3 次（0/2/4s），
+    #   实测小助手那次调用 deepseek 连返 3 次空 choices，白烧约 12s 才轮到备通道。
+    #   现在改成「连续两次空即判该通道本次已死」，跳过第 3 次排期直接换通道。
+    check("主通道只试 2 次即判死（不再排满 3 次）",
+          rec.seen.count("deepseek") == 2, str(rec.seen))
     check("最后落到备用通道", rec.seen[-1] == "premium", str(rec.seen))
-    # 计划：主通道 0/2/4s，备用通道 0/2s —— 备用通道首次成功，故只累积了 2+4
-    check("重试之间有退避等待", rec.waits == [2.0, 4.0], str(rec.waits))
+    # 计划：主通道 0/2/4s，备用通道 0/2s。
+    #   第 1 次不退避（0.0 不记录）；第 2 次退避 2.0 → 空 → 判死，跳过第 3 次的 4.0；
+    #   备通道首次不退避（0.0 不记录）即成功。故只累积 [2.0]。
+    check("重试之间有退避等待", rec.waits == [2.0], str(rec.waits))
     uninstall()
 finally:
     restore()
@@ -502,6 +508,70 @@ for label, exc, expect in [
 ]:
     check(f"{label} → {'重试' if expect else '立刻失败'}",
           ig._is_transient_image_error(exc) is expect)
+
+# ══════════════════════════════════════════════════════════
+# 连续两次空响应 = 该通道本次已死 → 跳过它剩余的排期，直接换通道
+# （2026-10-06 实测：deepseek 连返 3 次空 choices，白烧约 12s 才轮到备通道）
+# ★ 单次空响应仍要原地重试一次 —— 那可能只是抖动（既有用例已断言此行为）
+# ══════════════════════════════════════════════════════════
+_empty = Exception(f"{llm.EMPTY_UPSTREAM}: 上游返回了空的 choices")
+_ok_after_empty = FakeResponse(choices=[FakeChoice(FakeMessage(content="第一次空后重试成功"))])
+
+# ① 单次空响应：应在同一通道原地重试，不急着换通道
+rec = install({"deepseek": [_empty, _ok_after_empty], "premium": []})
+restore = _patch_channels()
+try:
+    out = llm.chat([{"role": "user", "content": "hi"}])
+    check("单次空响应：原地重试即成功", out == "第一次空后重试成功", str(out))
+    check("单次空响应不会误判通道死（未切 premium）",
+          rec.seen.count("premium") == 0, str(rec.seen))
+finally:
+    restore()
+    uninstall()
+
+# ② 连续两次空响应：判死，跳过第 3 次排期，直接换通道
+_ok_premium = FakeResponse(choices=[FakeChoice(FakeMessage(content="OK"))])
+rec = install({"deepseek": [_empty, _empty, _empty], "premium": [_ok_premium]})
+restore = _patch_channels()
+try:
+    out = llm.chat([{"role": "user", "content": "hi"}])
+    check("连续空响应后仍能拿到结果（切到备通道）", out == "OK", str(out))
+    n_ds = rec.seen.count("deepseek")
+    check("主通道只试 2 次即判死（不再排满 3 次）", n_ds == 2, f"实际 {n_ds} 次")
+    check("切到了备通道", rec.seen.count("premium") == 1, str(rec.seen))
+finally:
+    restore()
+    uninstall()
+
+# 空响应判定本身
+check("空响应能被识别", llm._is_empty_response(_empty) is True)
+check("超时不算空响应（忙 ≠ 通道坏，仍值得重试）",
+      llm._is_empty_response(Exception("Request timed out.")) is False)
+check("502 不算空响应", llm._is_empty_response(_Err("502 Bad Gateway", 502)) is False)
+
+# 交互式问答：预算必须封顶，且单次超时远小于全局 180s
+check("小助手单次超时远小于全局",
+      llm.HELPER_ATTEMPT_TIMEOUT_SEC < llm.REQUEST_TIMEOUT_SEC,
+      f"{llm.HELPER_ATTEMPT_TIMEOUT_SEC} vs {llm.REQUEST_TIMEOUT_SEC}")
+
+# ★ 排期必须给兜底留位置（第一版翻车：主通道 2 次就把预算吃满，兜底排不进去）
+plan_h = llm._interactive_plan([CH_DS, CH_PM])
+check("有兜底时：主通道 2 次 + 兜底 1 次",
+      [c.name for c, _ in plan_h] == ["deepseek", "deepseek", "premium"],
+      str([c.name for c, _ in plan_h]))
+worst_h = sum(llm.HELPER_ATTEMPT_TIMEOUT_SEC + w for _, w in plan_h)
+check("最坏耗时不超过总预算（参数改坏会被这里抓住）",
+      worst_h <= llm.HELPER_TOTAL_BUDGET_SEC,
+      f"最坏 {worst_h}s vs 预算 {llm.HELPER_TOTAL_BUDGET_SEC}s")
+check("兜底排在最后且不退避", plan_h[-1] == (CH_PM, 0.0), str(plan_h[-1]))
+
+# 只有一个通道时，预算应当全部归它（不留无谓的 reserve）
+plan_h1 = llm._interactive_plan([CH_DS])
+check("无兜底时主通道可排满 3 次", len(plan_h1) == 3, str(len(plan_h1)))
+worst_h1 = sum(llm.HELPER_ATTEMPT_TIMEOUT_SEC + w for _, w in plan_h1)
+check("单通道最坏耗时也不超预算",
+      worst_h1 <= llm.HELPER_TOTAL_BUDGET_SEC,
+      f"最坏 {worst_h1}s vs 预算 {llm.HELPER_TOTAL_BUDGET_SEC}s")
 
 uninstall()
 print()

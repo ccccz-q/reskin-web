@@ -676,10 +676,28 @@ def _run_resilient(attempt, plan, *, label: str, timeout_budget: int = 2):
 
     attempt(channel) -> 结果；出错抛 LLMError。
     timeout_budget：允许几次超时（超时是"最贵"的失败，重试要克制）。
+
+    ★ 连续两次空响应 = 这条通道对本次请求已死，跳过它剩余的排期（2026-10-06 实测）：
+      build_plan 会给主通道排 3 次（0/2/4s）。实测小助手那次调用里，
+      deepseek 连返 3 次「HTTP 200 但 choices 为空」——烧掉约 12 秒全部落空，
+      才轮到备通道，用户干等 30.8 秒。
+      注释里早就写着「在同一条坏通道上重试多少次都是空的」，可计划仍排三次。
+
+      ★ 为什么是「两次」而不是「一次就判死」：
+        单次空响应确实可能只是抖动，原地重试一次常常就能拿到内容 ——
+        这是 `chat_with_tools` 那条既有用例断言过的行为，不能推翻。
+        但**连续两次都空**，就不是抖动了，第三次基本注定白等。
+        所以：允许原地重试 1 次，第二次仍空即判死，跳过剩余排期直接换通道。
+      超时不算（上游忙 ≠ 通道坏，那类重试是有意义的，走 timeout_budget 另算）。
     """
     last: Exception | None = None
     timeout_seen = 0
+    dead_channels: set[str] = set()
+    empty_streak: dict[str, int] = {}
     for ch, wait in plan:
+        # 这条通道已被判死（连续两次空响应）：跳过它剩下的所有排期
+        if ch.name in dead_channels:
+            continue
         if wait:
             _sleep(wait)
         try:
@@ -697,9 +715,35 @@ def _run_resilient(attempt, plan, *, label: str, timeout_budget: int = 2):
                 # 鉴权失败 / 请求体非法这类**确定性**错误：重试没有意义，立刻失败。
                 # 快速失败也能避免把「key 配错了」包装成「上游抽风」，掩盖真问题。
                 raise LLMError(f"{type(e).__name__}: {e}") from e
-            logger.warning("%s 瞬时错误（通道 %s，将重试）：%s",
-                           label, ch.name, str(e)[:160])
+            if _is_empty_response(e):
+                empty_streak[ch.name] = empty_streak.get(ch.name, 0) + 1
+                if empty_streak[ch.name] >= 2:
+                    dead_channels.add(ch.name)
+                    logger.warning("%s 通道 %s 连续 %d 次空响应（判定本次不可用，"
+                                   "跳过其剩余排期，直接换通道）：%s",
+                                   label, ch.name, empty_streak[ch.name],
+                                   str(e)[:120])
+                else:
+                    logger.warning("%s 通道 %s 空响应（第 1 次，原地重试一次）：%s",
+                                   label, ch.name, str(e)[:120])
+            else:
+                logger.warning("%s 瞬时错误（通道 %s，将重试）：%s",
+                               label, ch.name, str(e)[:160])
     raise LLMError(f"{type(last).__name__}: {last}") from last
+
+
+def _is_empty_response(e: Exception) -> bool:
+    """是不是「上游假装成功」——HTTP 200 但内容为空
+
+    这类失败与超时/502 性质完全不同：它不是忙，而是**这条通道此刻给不出内容**，
+    在同一条通道上再试多少次都是空的（2026-10-03 已记录过这个教训）。
+    判据用类型名 + 文案双保险：异常类型可能来自第三方 SDK，名字不保证统一。
+    """
+    name = type(e).__name__.lower()
+    if "empty" in name:
+        return True
+    msg = str(e).lower()
+    return ("空的 choices" in msg or "empty" in msg and "choice" in msg)
 
 
 def _chat_once(
@@ -776,6 +820,83 @@ def chat(
                           response_format, timeout, max_retries)
 
     return _run_resilient(attempt, build_plan(channels), label="LLM")
+
+
+# ── 交互式问答（小助手）的等待预算 ───────────────────────────
+#   与收尾文案同源思路：用户在屏幕前等着，档位必须按「人等得住」来定，
+#   不能套批量流水线的容错。
+#   ★ 两个数字必须满足：3 × 单次 + 1s 退避 ≤ 总预算
+#     （最坏情况 = 主通道 2 次 + 兜底 1 次）。默认 3×18+1 = 55s ≤ 60s。
+#     改任一参数都要保证这个式子成立 —— test_llm_resilience 里有对应断言。
+HELPER_ATTEMPT_TIMEOUT_SEC = int(os.getenv("HELPER_ATTEMPT_TIMEOUT_SEC", "18"))
+HELPER_TOTAL_BUDGET_SEC = int(os.getenv("HELPER_TOTAL_BUDGET_SEC", "60"))
+# 小助手看图：带图比纯文本慢，给纯文本的近两倍；但同样不套全局 180s
+HELPER_VISION_TIMEOUT_SEC = int(os.getenv("HELPER_VISION_TIMEOUT_SEC", "30"))
+
+
+def chat_interactive(
+    messages: list[dict],
+    *,
+    temperature: float = 0.4,
+    max_tokens: int = 500,
+    response_format: dict | None = None,
+) -> str:
+    """**交互式问答专用**（小助手）：总预算封顶，且**空响应立刻换通道**。
+
+    ★ 为什么不能直接用 chat()（2026-10-06 实测，用户反馈「小助手回复慢」）：
+      chat() 走 build_plan 完整档位，而全局 REQUEST_TIMEOUT_SEC=180s ——
+      主通道 3 次（0/2/4s）+ 备通道 2 次（0/2s），单次可等 180s，
+      最坏理论值超过 9 分钟。那是给「模板工坊跑 8–9 次调用、失败就整轮报废」
+      设计的，**用在问答上就是把批量的容错套到等人身上**。
+
+      实测那一次 30.8s 的构成：deepseek 连返 3 次空 choices（17→22→29s），
+      三次全落空后才轮到 gpt-5.5 —— 光重试就白烧 12 秒。
+
+    现在：
+      · 单次 18s（问答不需要 180s 的耐心），总预算 60s 硬闸
+      · 保留备通道兜底 —— deepseek 空响应是常态，没有兜底小助手会直接不可用
+      · 配合 _run_resilient 的「连续空响应即换通道」，不再在同一条死通道上排队
+    失败由调用方给出「稍等再问」这类可执行的回话，不让用户干等。
+    """
+    channels = _text_channels(False)
+    if not channels:
+        raise LLMError("没有可用的文本模型通道（请检查 DEEPSEEK_* 配置）")
+
+    def attempt(ch: _Channel) -> str:
+        return _chat_once(ch, messages, temperature, max_tokens,
+                          response_format, HELPER_ATTEMPT_TIMEOUT_SEC, 0)
+
+    plan = _interactive_plan(channels)
+    # 计划本身已按预算排好，超时不需要额外的「克制」闸 —— 让它排完即可
+    return _run_resilient(attempt, plan, label="小助手问答",
+                          timeout_budget=len(plan))
+
+
+def _interactive_plan(channels: list[_Channel]) -> list[tuple[_Channel, float]]:
+    """交互式问答的排期：主通道尽量多试，**但兜底必须留一次**
+
+    ★ 这里有个必须想清楚的取舍（第一版就在这里翻过车）：
+      按预算从前往后排，主通道试 2 次就把 60s 吃满了，兜底通道**一次都排不进去** ——
+      等于「保留了备通道」是句空话，主通道一死小助手就整个不可用。
+
+    所以：**先给兜底预留一次**（reserve），剩下的预算才归主通道。
+      有兜底 → 主 2 次（0/1s）+ 兜底 1 次，最坏 3×18+1 = 55s
+      无兜底 → 预算全归主通道，可排满 3 次（0/1/2s），最坏 3×18+3 = 57s
+    """
+    primary, *fallbacks = channels
+    reserve = HELPER_ATTEMPT_TIMEOUT_SEC if fallbacks else 0
+    plan: list[tuple[_Channel, float]] = []
+    elapsed = 0.0
+    for w in (0.0, 1.0, 2.0):
+        if elapsed + w + HELPER_ATTEMPT_TIMEOUT_SEC + reserve > HELPER_TOTAL_BUDGET_SEC:
+            break
+        plan.append((primary, w))
+        elapsed += w + HELPER_ATTEMPT_TIMEOUT_SEC
+    for ch in fallbacks:
+        plan.append((ch, 0.0))       # 兜底不再受预算砍：它就是底线
+    if not plan:                     # 预算小到一次都排不下 —— 那也要试一次
+        plan = [(primary, 0.0)]
+    return plan
 
 
 def vision(
