@@ -208,13 +208,21 @@ def _s9():
                   "user_notes": "主体必须保持可辨认",
                   "style_prompt": "", "base_family_id": fam_id,
                   "name": f"e2e-{uuid.uuid4().hex[:6]}"})
-    forge_id = d.get("forge_id") or d.get("task_id")
-    assert forge_id, f"没拿到 forge_id：{str(d)[:300]}"
-    print(f"    forge_id={forge_id}，提炼中（这一步最慢，请耐心）…")
+            # ★ task_id（ftask_xxx）是任务句柄，forge_id（draft_xxx）是草稿 id ——
+    #   两者不是一回事。之前误用 task_id 去查草稿 → 404「找不到这份草稿」。
+    task_id = d.get("task_id")
+    assert task_id, f"没拿到 task_id：{str(d)[:300]}"
+    print(f"    task_id={task_id}，提炼中（这一步最慢，请耐心）…")
     last = ""
-    for i in range(560):                       # 最多等约 9 分钟
+    # ★ 上限 720s 的理由（2026-10-07调整）：
+    #   硬闸是 360s，但硬闸只在**阶段之间**检查；
+    #   若此刻已有一个调用在飞（例如自修轮那次），收尾要等它返回。
+    #   实测最坏：360s 硬闸 + 一个已发出的 150s 调用 ≈ 510s，
+    #   加上落库与状态写回，留 720s 才有余量。
+    #   （之前设 560s，把"已跑通"误报成"超时"了。）
+    for i in range(720):                       # 最多等约 12 分钟
         time.sleep(1.0)
-        snap = req("GET", f"/api/forge/tasks/{forge_id}")
+        snap = req("GET", f"/api/forge/tasks/{task_id}")
         st = snap.get("status")
         msg = (snap.get("message") or snap.get("stage") or "")
         if msg and msg != last:
@@ -223,13 +231,25 @@ def _s9():
         if st in ("done", "failed", "error"):
             print(f"    终态：{st}")
             assert st == "done", f"提炼失败：{str(snap)[:250]}"
+            res = snap.get("result") or {}
+            forge_id = res.get("id")
+            if not forge_id:
+                raise RuntimeError(f"任务完成但没返回草稿 id：{str(snap)[:200]}")
+            print(f"    任务返回：{res.get('name')}（草稿 {forge_id}）")
+            if res.get("warnings"):
+                print(f"    警告：{res['warnings'][:2]}")
+            # ★ 任务快照**不回传完整 spec**（那是给前端轮询用的轻量视图），
+            #   要验证草稿真的落库了，得去查草稿本身。
             row = req("GET", f"/api/forge/{forge_id}")
             spec = row.get("spec") or {}
-            print(f"    家族名：{row.get('name')}")
-            print(f"    画幅：{len(spec.get('canvas') or [])//2} 种，"
-                  f"参数 {len(spec.get('params_schema') or [])} 项")
-            assert spec, "提炼完成但spec 为空"
-            return row
+            print(f"    草稿已入库：{row.get('name')} v{row.get('version')}")
+            print(f"    参数 {len(spec.get('params') or {})} 项，"
+                  f"segments {len(spec.get('segments') or {})} 段，"
+                  f"画幅 {len(spec.get('canvas') or []) // 2} 种")
+            assert spec, "草稿已入库但 spec 为空"
+            assert (spec.get("params") or spec.get("segments")), \
+                "spec 里既无 params 也无 segments，等于什么都没产出"
+            return {**row, "forge_id": forge_id}
     raise RuntimeError("工坊提炼 9 分钟仍未结束")
 
 

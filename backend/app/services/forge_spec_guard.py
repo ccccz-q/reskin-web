@@ -52,6 +52,81 @@ def _pos_conflict(line: str, preq: dict | None) -> bool:
     return any(k and k in low for k in (preq.get("keywords") or []))
 
 
+def _reconcile_dangling_placeholders(doc: dict) -> list[str]:
+    """把「引用了未声明参数」的占位符就地摘掉，返回被摘掉的清单
+
+    ★ 为什么加这个（2026-10-07 端到端实测踩到）
+    ---------------------------------------------
+    工坊真机跑，QC 把整份草稿拒了，理由是：
+        家族 xxx 引用了 {figure_count_desc}，但 dicts 里没有 figure_count，
+        params 里也没有名为 figure_count 的参数 —— 该占位符会渲染成空串
+
+    这条判据本身**完全正确**（空串确实不能接受），但它的后果不对：
+    为了一个**机械可修**的占位符问题，让用户等了 3 分钟、几十次模型调用的
+    整份草稿被拒掉、还要再花 70s 让模型重写一遍 —— 这是最贵的修法。
+
+    这里选择**摘掉占位符**而不是**补一个假参数**：
+      · 补参数 = 凭空造一个用户没要求、模型也没定义的旋钮，
+        还会在 UI 参数面板里显示一个莫名项；
+      · 摘掉 = 句子仍然通顺可读（"画面里有 {figure_count_desc} 细节"
+        → "画面里有细节"），并且**如实告诉用户摘了什么**。
+    两者都比"渲染成空串"好，也都比"整份拒掉"好。
+
+    ★ 与 QC 的关系：这是**前置**调和，QC 仍然是唯一的质量门——
+      摘完如果还有别的错，QC 照常拒。我们只解决"机械可修"的那一类。
+    """
+    from services.family_renderer import DERIVED_KEYS
+
+    dicts = set(doc.get("dicts") or {})
+    params = doc.get("params") or {}
+    removed: list[str] = []
+
+    def _fix(text):
+        if not isinstance(text, str) or "{" not in text:
+            return text
+        out, i = [], 0
+        while True:
+            j = text.find("{", i)
+            if j < 0:
+                out.append(text[i:])
+                break
+            k = text.find("}", j)
+            if k < 0:
+                out.append(text[i:])
+                break
+            name = text[j + 1:k].strip()
+            base = name[:-5] if name.endswith("_desc") else None
+            dangling = (base is not None and name not in DERIVED_KEYS
+                        and base not in dicts and base not in params)
+            if dangling:
+                removed.append(name)
+                out.append(text[i:j])      # 丢掉占位符本身，保留前后文字
+            else:
+                out.append(text[i:k + 1])
+            i = k + 1
+        # 摘掉占位符后常留下一个空格："画面里有{ph} 细节" → "画面里有 细节"。
+        #   英文里那个空格是对的，中文里就是多余的。
+        #   只在**两侧都是中日韩字符**时收紧 —— 这样绝不会误伤英文正文。
+        import re as _re
+        merged = " ".join("".join(out).split())
+        merged = _re.sub(
+            r"(?<=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])\s+"
+            r"(?=[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef])", "", merged)
+        return merged
+
+    for container in (doc.get("segments"), doc):
+        if not isinstance(container, dict):
+            continue
+        for k, v in list(container.items()):
+            if isinstance(v, str):
+                container[k] = _fix(v)
+            elif isinstance(v, dict):
+                for kk, vv in list(v.items()):
+                    if isinstance(vv, str):
+                        v[kk] = _fix(vv)
+    return sorted(set(removed))
+
+
 def _normalize(doc: Any) -> dict:
     """把模型输出规整成能落盘的家族结构（保留旧行为以兼容既有测试）"""
     if not isinstance(doc, dict):

@@ -455,7 +455,8 @@ check("缺 params 键也不炸（按空处理）",
 #   VLM 看图那条主路径完全不限时 —— 上游一卡，用户就是"转圈到天荒地旧"。
 #   这组断言守着三件事：阈值真的接上了、降级真的会走、预算到点不丢草稿。
 print("\n[测试 7] 阶段超时与总预算闸")
-import inspect as _inspect                              # noqa: E402
+import ast as _ast                                             # noqa: E402
+import inspect as _inspect                                    # noqa: E402
 
 check("config 里有VLM 单图超时且不小于实测最坏值(124s)",
       config.FORGE_VLM_TIMEOUT_SEC >= 124,
@@ -508,6 +509,75 @@ check("★ 预算到点走「收尾」而非「取消」（草稿不丢）",
       "if _stop() and not _budget_hit:" in _src)
 check("★ 预算到点会把实情写进 warnings（如实告知，不静悄悄）",
       "_budget_hit:" in _src and "warnings.append(msg)" in _src)
+
+
+# ══════════════════════════════════════════════════════════
+# 悬空占位符的前置调和（2026-10-07 端到端实测）
+# ══════════════════════════════════════════════════════════
+# ★ 事故：真机跑时 QC 拒掉整份草稿，理由是「引用了 {figure_count_desc}，
+#   但 params 里没有 figure_count」。那条判据是对的，但后果不对——
+#   一个机械可修的占位符问题，不该让 3 分钟的草稿整份作废。
+print("\n[测试 8] 悬空占位符调和（QC 前置）")
+_doc8 = {
+    "segments": {
+        "主体": "画面里有 {figure_count_desc} 细节，主体是 {subject.name}。",
+        "风格": "{palette_desc}，笔触是 {brush_desc}。",
+    },
+    "dicts": {"brush": {"a": "干笔"}},
+    "params": {"brush": {"type": "string"}},
+}
+_removed8 = guard._reconcile_dangling_placeholders(_doc8)
+check("摘掉了悬空的 figure_count_desc", "figure_count_desc" in _removed8, str(_removed8))
+check("★ 没摘合法的内建槽位 subject.name / palette_desc",
+      "subject.name" not in _removed8 and "palette_desc" not in _removed8, str(_removed8))
+check("★ 没摘有 dicts 支撑的 brush_desc", "brush_desc" not in _removed8, str(_removed8))
+check("摘完句子通顺（不是空串、也不是'有 细节'）",
+      _doc8["segments"]["主体"] == "画面里有细节，主体是 {subject.name}。",
+      repr(_doc8["segments"]["主体"]))
+check("合法占位符原样保留", "{subject.name}" in _doc8["segments"]["主体"])
+check("返回值去重且确定", _removed8 == sorted(set(_removed8)), str(_removed8))
+check("无悬空时返回空列表（不误伤）",
+      guard._reconcile_dangling_placeholders(
+          {"segments": {"a": "{subject.name} 在画面正中"},
+           "params": {"x": {"type": "string"}}}) == [])
+_prompt_f = (Path(__file__).resolve().parents[1] / "app" / "templates"
+             / "prompts" / "forge_compile.md")
+check("编译 prompt 里写明了占位符与 params 的对应关系（防第一次就错）",
+      _prompt_f.exists() and "占位符" in _prompt_f.read_text(encoding="utf-8"))
+
+print()
+print("\n[测试 9] wall_budget 端到端没有漏传")
+# ★ 事故：日志明写「未设墙钟预算，预算剩 ∞」，单图解构跑了 302s
+#   （本该 150s 截断）。根因是 wall_budget 加进了签名、加进了 _run_resilient，
+#   但**7 个调用点里只补了 2 个** —— 签名有、调用没传，等于完全没设预算。
+#   这类漏传读代码看不出来（参数有默认值，不传不报错），
+#   只能靠"签名有参数 → 调用点必须传"这条静态断言守住。
+_llm_src = (Path(__file__).resolve().parents[1] / "app"
+            / "services" / "llm.py").read_text(encoding="utf-8")
+_tree9 = _ast.parse(_llm_src)
+_lines9 = _llm_src.splitlines()
+_missing9 = []
+for _n9 in _ast.walk(_tree9):
+    if isinstance(_n9, _ast.FunctionDef):
+        _sig9 = "wall_budget" in _ast.unparse(_n9.args)
+        for _c9 in _ast.walk(_n9):
+            if isinstance(_c9, _ast.Call) and getattr(_c9.func, "id", "") == "_run_resilient":
+                _seg9 = "\n".join(_lines9[_c9.lineno - 1:_c9.end_lineno])
+                if _sig9 and "wall_budget" not in _seg9:
+                    _missing9.append(f"{_n9.name}:{_c9.lineno}")
+check("★ 凡是签名里有 wall_budget 的，_run_resilient 调用点都传了",
+      not _missing9, f"漏传：{_missing9}")
+for _fn9 in ("vision", "chat", "chat_with_tools"):
+    _f9 = getattr(llm_mod, _fn9, None)
+    try:
+        _has9 = "wall_budget" in str(_inspect.signature(_f9))
+    except (TypeError, ValueError):
+        _has9 = False
+    check(f"{_fn9}() 的签名里有 wall_budget", _has9)
+check("★ 阶段配额：解构最多吃 55%，给编译留额度",
+      "_DECODE_SHARE" in _inspect.getsource(sf.forge), "")
+check("★ 解构按阶段配额拿预算（而不是固定值）",
+      "wall_budget=_decode_budget()" in _inspect.getsource(sf.forge), "")
 
 print()
 print(f"结果：{PASS} 通过 / {FAIL} 失败")

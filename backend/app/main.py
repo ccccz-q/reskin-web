@@ -40,6 +40,7 @@ from config import (                                             # noqa: E402
     BACKEND_PORT,
     CORS_ALLOW_CREDENTIALS,
     CORS_ORIGINS,
+    MAX_GENERATIONS_PER_SESSION,
     FRONTEND_DIST,
     IMAGE_STORAGE_DIR,
     PUBLIC_MODE,
@@ -52,6 +53,7 @@ from config import (                                             # noqa: E402
 from governance.guard import policy_snapshot, reconcile_reservations  # noqa: E402
 from infra.logging import logger, recent_audit                   # noqa: E402
 from infra.security import LocalAccessMiddleware, security_snapshot  # noqa: E402
+from infra.worker_guard import check_multiworker                   # noqa: E402
 from routers.auth import router as auth_router                     # noqa: E402
 from routers.chat import router as chat_router                   # noqa: E402
 from routers.forge import router as forge_router                 # noqa: E402
@@ -69,6 +71,15 @@ async def lifespan(_app: FastAPI):
     """启动自检 —— 把"运行到第 8 步才发现"的坑提前到进程启动的那一刻"""
     logger.info("=" * 56)
     logger.info("换颜 · 图像创作 Agent 后端启动")
+    # ★ 配额护栏的前提自检（多进程会让进程内计数失效）
+    _qg = check_multiworker(logger)
+    if _qg["safe"]:
+        # 配额上限已从 config 具名导入（见文件头的 from config import (...)），
+        # 不在函数体里 import 整个 config —— 那是这个项目与 infra 的循环依赖雷区。
+        logger.info("配额护栏：单进程，计数有效（上限 %s）",
+                    MAX_GENERATIONS_PER_SESSION)
+    else:
+        logger.error("★ 配额护栏风险：%s", _qg["message"])
     logger.info("=" * 56)
 
     # ① 家族 / 模板能否全部加载（YAML 写错在这里就暴露，而不是点生成时 500）
@@ -294,6 +305,11 @@ async def health_check(thread_id: str = "default") -> dict:
         "context": context_store.stats(),
         "governance": policy_snapshot(thread_id),
         "security": security_snapshot(),
+        # ★ 多worker 自检（2026-07）：配额护栏是**进程内**计数，
+        #   部署成多进程就会静默失效。把它放进 health 是为了让部署者
+        #   **自己看得到**，而不是读日志才发现。详见 infra/worker_guard.py
+        #   与 tests/probe_multiworker.py 的实证。
+        "quota_guard": check_multiworker(logger),
         "reservations": context_store.reservations_stats(),
     }
     if PUBLIC_MODE:

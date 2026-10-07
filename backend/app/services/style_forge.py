@@ -169,6 +169,8 @@ def _vlm_json(image_path: str, system: str, extra: str = "",
                 #   上游卡住就是无限等。超时抛 LLMError → 上面 except 收{} →
                 #   这张图降级为纯证据卡，其余图照常，**整条链路不会死**。
                 timeout=timeout if timeout is not None else FORGE_VLM_TIMEOUT_SEC,
+                # ★ 同上：整张图（含重试）不许超过"单图上限"与"全链路剩余"中较小的那个
+                wall_budget=timeout if timeout is not None else FORGE_VLM_TIMEOUT_SEC,
             )
         return extract_json(_strip_fence(text)) or {}
     except Exception as e:
@@ -223,7 +225,8 @@ def _reference_evidence(image_paths: list[str], use_vlm: bool) -> tuple[list[dic
 
 def _decode_single(path: str, role: dict | None, evidence: dict,
                    use_vlm: bool = True, style_prompt: str = "",
-                   cancelled: "callable | None" = None) -> dict:
+                   cancelled: "callable | None" = None,
+                   wall_budget: float | None = None) -> dict:
     """① 单图解构：优先看图，失败则基于本地证据做文本解构
 
     ★ 每张图**只走一次模型**。
@@ -252,7 +255,8 @@ def _decode_single(path: str, role: dict | None, evidence: dict,
             "严禁发明任何 {花括号占位符}、严禁输出「段名:内容」式的槽位引用、"
             "严禁出现英文 Prompt 原文里的平台名称（Midjourney/Stable Diffusion 等）。"
         )
-    got = _vlm_json(path, _DECODE_SYSTEM, extra) if use_vlm else {}
+    got = (_vlm_json(path, _DECODE_SYSTEM, extra, timeout=wall_budget)
+            if use_vlm else {})
     if got.get("core_rules"):
         got["_source"] = "vlm"
         return got
@@ -526,7 +530,13 @@ def _synthesize(decodes: list[dict], theory: str,
 
 def _compile(card: dict, intent: str, base: dict | None,
              style_prompt: str = "", world: dict | None = None,
-             positive: dict | None = None) -> dict:
+             positive: dict | None = None,
+    budget_left: float = float("inf"),
+    # ★ budget_left：整条链路还剩多少秒（2026-10-07）。
+    #   它是**参数**而不是闭包里的函数 —— _compile 是模块级函数，
+    #   拿不到 forge() 的局部变量。传不进来的话就只能给固定值，
+    #   而固定值在链路已耗尽时会让编译再拿走 180s×2。
+) -> dict:
     """③ 视觉卡 → 家族 JSON
 
     world：世界观意图识别的命中结果（{"world_name", "world_kit"}，未命中为 None）。
@@ -588,7 +598,12 @@ def _compile(card: dict, intent: str, base: dict | None,
                #   实测编译 45s，给到 180s（4 倍余量）只为防上游异常，
                #   **不是为了赶时间** —— 超时的后果是"这次提炼失败"，
                #   不会降级出低质量草稿（QC 仍然是唯一的质量门）。
-               timeout=FORGE_COMPILE_TIMEOUT_SEC)
+               timeout=FORGE_COMPILE_TIMEOUT_SEC,
+               # ★ 按**剩余**预算给，而不是给固定值：
+               #   已用 300s 的时候不能让编译再拿走 180s×2。
+               # 编译拿**剩余的全部**——解构阶段已按比例预留过额度，
+               #   所以这里可以放心用满，不会出现"编译被饿死"。
+               wall_budget=min(FORGE_COMPILE_TIMEOUT_SEC, budget_left))
     return extract_json(_strip_fence(raw)) or {}
 
 
@@ -725,6 +740,7 @@ from services.forge_spec_guard import (                             # noqa: E402
     _norm_segments,
     _normalize,
     _pos_conflict,
+    _reconcile_dangling_placeholders,
     _protect_positive_requirements,
     _resolve_unknown_slots,
 )
@@ -753,6 +769,27 @@ def forge(
     耗时阶段之间检查，命中即返回 {"ok": False, "cancelled": True}；正在
     进行中的那一次模型调用无法被硬中断，但绝不会开始下一次。永不抛业务异常。
     """
+
+    def _budget_left() -> float:
+        """整条链路还剩多少秒（inf = 不设硬闸）"""
+        if _deadline is None:
+            return float("inf")
+        return max(0.0, _deadline - time.time())
+
+    #★ 阶段配额：解构最多只能吃掉总预算的一部分，**剩下的必须留给编译**。
+    #   为什么（2026-10-07 端到端实测）：上游慢的时候，解构会把 360s 里的
+    #   大头花光，等编译开始时 `_budget_left()` 已经很��，
+    #   编译被硬闸掐掉→ 用户等了 3 分半，**什么都没拿到**。
+    #   而编译是**唯一不可降级**的阶段（没有它就没有草稿），
+    #   所以它必须**预留**额度，而不是和其他阶段先到先得。
+    _DECODE_SHARE = 0.55        # 解构最多用掉 55%，至少留 45% 给编译
+
+    def _decode_budget() -> float:
+        """解构这一轮允许花多少（含重试）"""
+        left = _budget_left()
+        if left == float("inf"):
+            return float(FORGE_VLM_TIMEOUT_SEC)
+        return max(30.0, min(FORGE_VLM_TIMEOUT_SEC, left * _DECODE_SHARE))
 
     def _report(msg: str):
         if progress:
@@ -814,7 +851,10 @@ def forge(
                     lambda it: _decode_single(
                         it[1], role_by_i.get(it[0]),
                         ev_by_file.get(os.path.basename(it[1]), {}), use_vlm,
-                        style_prompt, cancelled=cancelled),
+                        style_prompt, cancelled=cancelled,
+                        # ★ 阶段配额（见 forge 里的 _DECODE_SHARE 注释）：
+                        #   解构最多吃掉总预算的一部分，保证编译有额度。
+                        wall_budget=_decode_budget()),
                     targets))
         decodes = results
     decode_sec = round(time.time() - started, 2)
@@ -855,7 +895,8 @@ def forge(
         _report("编译家族模板")
         with step("编译家族模板", images=len(paths), has_card=bool(card)):
             doc = _compile(card, intent, base_family, style_prompt,
-                           world=world or None, positive=preq or None)
+                           world=world or None, positive=preq or None,
+                           budget_left=_budget_left())
     except LLMError as e:
         return {"ok": False, "error": f"模型调用失败：{e}",
                 "evidence": evidence, "card": card}
@@ -870,6 +911,15 @@ def forge(
     #   归一化的目的是"把脏形状擦干净"，它自己必须是**永不抛**的那一层。
     try:
         doc = _normalize(doc)
+        # ★ 前置调和：摘掉「引用了未声明参数」的占位符（2026-10-07 端到端实测）。
+        #   放在归一化之后、QC 之前 —— 这类错误是**机械可修**的，
+        #   让它触发"整份草稿被拒 + 再花 70s 让模型重写"是最贵的修法。
+        #   摘了什么会写进 warnings，如实告诉用户，不静悄悄。
+        _dangling = _reconcile_dangling_placeholders(doc)
+        if _dangling:
+            warnings.append(
+                "模板里有几处占位符引用了未声明的参数（" + "、".join(_dangling)
+                + "），已移除以免渲染成空串；如需保留，请在参数面板里补上同名参数。")
     except Exception as e:                                    # noqa: BLE001
         logger.error("家族模板归一化失败（模型输出形状异常）：%s: %s",
                      type(e).__name__, e)
@@ -960,6 +1010,7 @@ def forge(
                     errors="\n".join(f"- {e}" for e in errors[:3]))},
             ], temperature=0.2, max_tokens=2600, premium=True,
             timeout=FORGE_REPAIR_TIMEOUT_SEC,
+            wall_budget=min(FORGE_REPAIR_TIMEOUT_SEC, _budget_left()),
                response_format={"type": "json_object"})
             fixed = extract_json(_strip_fence(repair))
             if isinstance(fixed, dict) and fixed:

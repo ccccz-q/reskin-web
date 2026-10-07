@@ -534,7 +534,8 @@ def build_plan(channels: list[_Channel]) -> list[tuple[_Channel, float]]:
     return plan
 
 
-def _run_resilient(attempt, plan, *, label: str, timeout_budget: int = 2):
+def _run_resilient(attempt, plan, *, label: str, timeout_budget: int = 2,
+                   wall_budget: float | None = None):
     """按计划执行；任何一次成功就返回
 
     ★ 为什么要有这层（统一而非分散）：
@@ -562,10 +563,27 @@ def _run_resilient(attempt, plan, *, label: str, timeout_budget: int = 2):
     timeout_seen = 0
     dead_channels: set[str] = set()
     empty_streak: dict[str, int] = {}
+    # ★ wall_budget：整个调用（含全部重试与退避）的墙钟上限（2026-10-07）
+    #   为什么需要它：timeout 参数是**单次尝试**的上限，而计划里有多次尝试。
+    #   实测踩到：单图解构 timeout=150s，上游超时后重试一次 → 250s；
+    #   编译 timeout=180s + 重试 → 285s。于是"阶段超时 150s"实际给了 300s，
+    #   整条工坊链路的 360s 预算被一次编译吃光。
+    #   有了它：**重试前先看还剩多少预算**，不够就不再试——
+    #   "多试一次可能成功"和"用户已经等太久"之间，必须有后者来裁决。
+    _t0 = time.monotonic()
+
+    def _left() -> float:
+        return float("inf") if not wall_budget else (wall_budget - (time.monotonic() - _t0))
+
     for ch, wait in plan:
         # 这条通道已被判死（连续两次空响应）：跳过它剩下的所有排期
         if ch.name in dead_channels:
             continue
+        # ★ 退避前先看预算：宁可少试一次，也别把用户的等待拖长
+        if wall_budget and (wait > _left() or _left() <= 0):
+            raise LLMError(
+                f"{label} 超出墙钟预算 {wall_budget:.0f}s（已用 {time.monotonic() - _t0:.0f}s）"
+            ) from last
         if wait:
             _sleep(wait)
         try:
@@ -576,8 +594,16 @@ def _run_resilient(attempt, plan, *, label: str, timeout_budget: int = 2):
                 timeout_seen += 1
                 if timeout_seen >= timeout_budget:
                     raise LLMError(f"{type(e).__name__}: {e}") from e
-                logger.warning("%s 超时（第 %d 次，重试 1 次）：%s",
-                               label, timeout_seen, str(e)[:160])
+                if wall_budget and _left() <= 0:
+                    raise LLMError(
+                        f"{label} 超时且已用满墙钟预算 {wall_budget:.0f}s") from e
+                _lv = _left()
+                logger.warning(
+                    "%s 超时（第 %d 次%s，预算剩 %s）：%s",
+                    label, timeout_seen,
+                    "，未设墙钟预算" if _lv == float("inf") else "，重试 1 次",
+                    "∞" if _lv == float("inf") else f"{_lv:.0f}s",
+                    str(e)[:160])
                 continue
             if not _is_transient(e):
                 # 鉴权失败 / 请求体非法这类**确定性**错误：重试没有意义，立刻失败。
@@ -660,8 +686,14 @@ def chat(
     timeout: float | None = None,
     max_retries: int = 0,
     premium: bool = False,
+    wall_budget: float | None = None,
 ) -> str:
     """纯文本对话（不带工具）
+
+    wall_budget：**含全部重试**的墙钟上限（2026-10-07）。
+      与 timeout 的区别：timeout 是单次尝试，wall_budget 是整条计划。
+      没有它，"阶段超时 180s" 实际会变成 180×2=360s（重试一次），
+      整条工坊链路的总预算被一次编译吃光。
 
     timeout：单次调用超时秒数，默认用全局 REQUEST_TIMEOUT_SEC。
     max_retries：客户端级重试次数，默认 **0**。
@@ -687,7 +719,8 @@ def chat(
         return _chat_once(ch, messages, temperature, max_tokens,
                           response_format, timeout, max_retries)
 
-    return _run_resilient(attempt, build_plan(channels), label="LLM")
+    return _run_resilient(attempt, build_plan(channels), label="LLM",
+                          wall_budget=wall_budget)      # ★ 同上
 
 
 # ── 交互式问答（小助手）的等待预算 ───────────────────────────
@@ -708,6 +741,7 @@ def chat_interactive(
     temperature: float = 0.4,
     max_tokens: int = 500,
     response_format: dict | None = None,
+    wall_budget: float | None = None,
 ) -> str:
     """**交互式问答专用**（小助手）：总预算封顶，且**空响应立刻换通道**。
 
@@ -737,7 +771,8 @@ def chat_interactive(
     plan = _interactive_plan(channels)
     # 计划本身已按预算排好，超时不需要额外的「克制」闸 —— 让它排完即可
     return _run_resilient(attempt, plan, label="小助手问答",
-                          timeout_budget=len(plan))
+                          timeout_budget=len(plan),
+                          wall_budget=wall_budget)
 
 
 def _interactive_plan(channels: list[_Channel]) -> list[tuple[_Channel, float]]:
@@ -774,6 +809,7 @@ def vision(
     temperature: float = 0.3,
     response_format: dict | None = None,
     timeout: float | None = None,
+    wall_budget: float | None = None,
 ) -> str:
     """视觉模型调用（看图）—— 走与文本通道同一套容错
 
@@ -812,7 +848,8 @@ def vision(
             raise _empty_error(resp)
         return text
 
-    return _run_resilient(attempt, build_plan(channels), label="视觉模型")
+    return _run_resilient(attempt, build_plan(channels), label="视觉模型",
+                          wall_budget=wall_budget)   # ★ 别漏：漏了等于没设预算
 
 
 def chat_with_tools(
@@ -820,6 +857,7 @@ def chat_with_tools(
     tools: list[dict],
     tool_choice: str = "auto",
     temperature: float = 0.2,
+    wall_budget: float | None = None,
 ) -> dict:
     """带工具的一轮对话
 
@@ -904,7 +942,8 @@ def chat_with_tools(
             "finish_reason": finish,
         }
 
-    return _run_resilient(attempt, build_plan(channels), label="工具轮 LLM")
+    return _run_resilient(attempt, build_plan(channels), label="工具轮 LLM",
+                          wall_budget=wall_budget)
 
 
 # ── 收尾文案的「等待预算」三件套（2026-10-06）────────────────────────
@@ -918,7 +957,9 @@ FINAL_SUMMARY_TOTAL_BUDGET_SEC = int(os.getenv("FINAL_SUMMARY_TOTAL_BUDGET_SEC",
 _FINAL_SUMMARY_WAITS = (0.0, 1.5, 3.0)      # 3 次：0s / 1.5s / 3s（合计退避 4.5s）
 
 
-def summarize_for_final(messages: list[dict]) -> dict:
+def summarize_for_final(messages: list[dict],
+    wall_budget: float | None = None,
+) -> dict:
     """**收尾总结专用**：不换通道、总预算封顶，但**给足 3 次机会**。
 
     ★ 为什么要单独开一条（2026-10-06，用户实测「收尾文案 2 分钟」）：
@@ -989,8 +1030,10 @@ def summarize_for_final(messages: list[dict]) -> dict:
     #   与主链路「超时不重试」相反，因为这里有总预算硬闸兜着，
     #   多试一次的代价可控，而放弃的代价是用户拿不到文案。
     return _run_resilient(attempt, plan, label="收尾总结",
-                          timeout_budget=len(plan))
-    return _run_resilient(attempt, plan, label="收尾总结", timeout_budget=1)
+                          timeout_budget=len(plan),
+                          wall_budget=wall_budget)
+    return _run_resilient(attempt, plan, label="收尾总结", timeout_budget=1,
+                          wall_budget=wall_budget)
 
 
 def secretary(messages: list[dict], max_tokens: int = 300) -> str:
