@@ -52,9 +52,14 @@ from governance.guard import (                                       # noqa: E40
     settle_generation,
 )
 from infra.logging import audit, logger, step                           # noqa: E402
-from infra.storage import to_url, is_retired_seed              # noqa: E402
+from infra.storage import (                                       # noqa: E402
+    is_retired_seed,
+    retired_seed_names,
+    to_url,
+)
 from services.card_extractor import build_card, summarize_card       # noqa: E402
 from services.identity import (                                      # noqa: E402
+    quota_key,
     DEFAULT_SESSION,
     is_anonymous_fallback,
     merge_thread,
@@ -213,7 +218,10 @@ async def generate(
     locked: str = Form(""),
     sid: str = Depends(session_dep),
 ) -> dict:
-    tid = merge_thread(thread_id, sid)   # ★ header 会话优先（配额与图库都按它隔离）
+    tid = merge_thread(thread_id, sid)   # 历史命名空间
+    # ★ 配额账本另算：merge_thread 的回退分支用的是用户可控的 thread_id，
+    #   拿它当配额键等于「换个 thread_id 就绕过额度」（见 identity.quota_key）
+    qkey = quota_key(thread_id, sid, request)
 
     # ① 上传（内部已做体积 + 真实格式校验，不合格直接 400/415）
     saved = await run_in_threadpool(validate_and_save, file, "upload", sid)
@@ -224,11 +232,11 @@ async def generate(
     #      而出图内部还会 raise ValueError —— 那类异常穿过 except，
     #      票据就悬着不动：用户没拿到图、额度却一直被扣到 TTL 到期。
     try:
-        token = reserve_generation(tid, reference_image=saved["path"])
+        token = reserve_generation(qkey, reference_image=saved["path"])
     except GovernanceError as e:
         status = 429 if e.code == "quota_exhausted" else 403
         raise HTTPException(status, {"code": e.code, "message": str(e)}) from e
-    quota_guard = new_generation_guard(tid, token, reference_image=saved["path"])
+    quota_guard = new_generation_guard(qkey, token, reference_image=saved["path"])
 
     try:
         # ③ 提炼创作卡 —— 出图路径本来就在花钱，多一次小调用换「反推 forbid」生效。
@@ -328,6 +336,7 @@ async def render(req: RenderRequest) -> dict:
 
 @router.post("/repair", summary="局部修复刚生成的图（外科修复：只改指定处，其余保持）")
 async def repair(
+    request: Request,          # ★ 用于推导配额账本键（见 identity.quota_key）
     change: str = Form(..., description="要修的具体问题（每行一条，最多 3 条）"),
     reference: str = Form(..., description="刚生成图的 url（gallery/生成结果返回的 url 形态）"),
     thread_id: str = Form("default"),
@@ -362,9 +371,10 @@ async def repair(
     if not may_read(ref_path, sid):
         raise HTTPException(404, "图片不存在")
 
-    tid = merge_thread(thread_id, sid)   # ★ 与 /generate 同口径（见 docstring）
+    tid = merge_thread(thread_id, sid)   # 与 /generate 同口径
+    qkey = quota_key(thread_id, sid, request)
     try:
-        token = reserve_generation(tid, reference_image=ref_path)
+        token = reserve_generation(qkey, reference_image=ref_path)
     except GovernanceError as e:
         status = 429 if e.code == "quota_exhausted" else 403
         raise HTTPException(status, {"code": e.code, "message": str(e)}) from e
@@ -374,7 +384,7 @@ async def repair(
         change, build_repair_constraints(extra_prompt, family_id))
 
     # ★ 与 /generate 同一套归还保证：release 幂等，放在 finally 里
-    quota_guard = new_generation_guard(tid, token, reference_image=ref_path)
+    quota_guard = new_generation_guard(qkey, token, reference_image=ref_path)
     try:
         try:
             result = await run_in_threadpool(
@@ -490,6 +500,28 @@ def _gallery_sync(limit: int, sid: str = DEFAULT_SESSION,
       于是公开版里任何没带头（爬虫、裸 curl、localStorage 被清）的请求
       都会拿到**全体访客**的图片列表。现在多一条分支：公开版的身份未知
       请求只给公共展示图。判定统一问 identity.is_anonymous_fallback。
+
+    ★★ 目录 mtime 增量（2026-10-07 压测实测：831 张图冷扫0.87s）
+      --------------------------------------------------------
+      目录的 mtime 只在**该目录下有条目被增/删/改名**时才变，
+      而文件内部的修改（改字节、touch）不会让它变。所以：
+      mtime 没变 == 这个目录的文件清单没变，可以直接复用上次的
+      stat 结果，不必对每个文件再 stat 一次。
+
+      **取舍：mtime 粒度不够细时宁可多扫一次**
+      mtime 的精度取决于文件系统：NTFS/ext4 是纳秒级（本机实测
+      连续三次增删能分辨出三个不同的 mtime_ns），但 ext3 / 部分
+      网络盘只有**秒级**，同一秒内的增删在索引看来就是"没变"。
+      那会让刚落盘的新图在最长一个 TTL 周期内不出现 —— 正是
+      "漏掉新图"这种绝对不能接受的错。
+
+      所以判定分两层，任一不满足就回落到逐文件 stat：
+        ① 目录 mtime 变了 → 重扫；
+        ② **本次 os.walk 拿到的文件名字典序与上次不同** → 重扫。
+      ② 的成本是O(目录内文件数 × 字符串比较)，不碰磁盘，
+      而它把 mtime 粒度这个洞**彻底堵上了**：只要文件清单变了
+      （同秒内增删也算），就一定重扫。mtime 从"唯一依据"降级成
+      "快速路径的门票"，正确性不再依赖文件系统的精度。
     """
     if is_anonymous_fallback(sid):
         roots = [IMAGE_STORAGE_DIR / "_seed"]
@@ -498,15 +530,10 @@ def _gallery_sync(limit: int, sid: str = DEFAULT_SESSION,
     else:
         roots = [IMAGE_STORAGE_DIR / sid, IMAGE_STORAGE_DIR / "_seed"]
 
+    # ★ 退役名单**每次扫描读一次**，而不是每个文件读一次（见下方注释）
+    retired = retired_seed_names()
+
     items: list[dict] = []
-    # ★★ 遍历方式的改造（2026-10-07 压测实测：1623 个文件要 1.4s）
-    #   旧写法有两个硬伤：
-    #     ① 每个文件**两次 stat** —— `p.is_file()` 一次、`p.stat()` 又一次。
-    #        rglob 出来的路径已经是我们要的，直接 stat 一次、用 S_ISREG 判类型即可。
-    #     ② `.thumbs` 等派生目录**进了目录才被逐个文件丢掉** ——
-    #        等于把整个缩略图目录 rglob 一遍再 discard，白扫。
-    #   改成 os.walk 并在**遍历期剪枝**：派生目录根本不会走下去。
-    #   实测两项合计把画廊扫描从 O(2N stat + 派生目录全遍历) 降到 O(N stat)。
     for root in roots:
         if not root.exists():
             continue
@@ -514,13 +541,25 @@ def _gallery_sync(limit: int, sid: str = DEFAULT_SESSION,
             # ★ 遍历期剪枝：派生缓存目录（.thumbs 等）整棵跳过，
             #   不再"进去了再逐个文件判断后丢弃"。
             dirnames[:] = [d for d in dirnames if not d.startswith(".")]
-            for fn in filenames:
-                # ★ 先看后缀（零IO），再 stat —— 顺序反了会白白多花一次 stat
-                if Path(fn).suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+            # ★ 先按后缀筛（零 IO），只有留下来的才需要 stat。
+            #   ★ 必须 sort()：os.walk 给的文件名顺序不保证稳定，
+            #     而下面拿它跟索引里的旧名单做等值比较 ——
+            #     顺序不同就会误判成"目录变了"，退化成每次全量重扫。
+            candidates = sorted(fn for fn in filenames
+                                if Path(fn).suffix.lower() in _GALLERY_SUFFIXES)
+            key = os.path.normcase(os.path.abspath(dirpath))
+            hit = _gallery_index.get(key)
+            if hit is not None:
+                dir_mtime, cached_names, cached = hit
+                # 见 docstring：mtime 之外再比文件名，把秒级 mtime 的洞堵上
+                if dir_mtime == _dir_mtime_ns(dirpath) and cached_names == candidates:
+                    items.extend(cached)
                     continue
+            entries = []
+            for fn in candidates:
                 fp = Path(dirpath) / fn
                 try:
-                    st = fp.stat()          # 一次 stat 同时解决"是不是文件"与"大小/时间"
+                    st = fp.stat()      # 一次 stat 同时解决"是不是文件"与"大小/时间"
                 except OSError:
                     continue
                 if not stat_module.S_ISREG(st.st_mode):
@@ -528,7 +567,11 @@ def _gallery_sync(limit: int, sid: str = DEFAULT_SESSION,
                 # ★ 退役种子图（2026-10-05 用户要求把首屏重复图真正下掉）：
                 #   平台是"上传覆盖"语义，包里删文件线上不会消失，所以退役图
                 #   仍躺在磁盘上；靠这份名单在**列表层**跳过，首屏与仓库就都是 17 张。
-                if is_retired_seed(fp):
+                #   ★ 名单是本次扫描开头**一次性**读好的（见上方 retired）：
+                #     旧写法每个文件都重读一次 retired.txt，831 个文件就是
+                #     831 次读盘 —— 实测占整个冷扫描的 10%。语义不变：
+                #     同一份名单、同样的比较，只是读一次而不是 N 次。
+                if fn in retired:
                     continue
                 try:
                     rel_root = fp.relative_to(IMAGE_STORAGE_DIR)
@@ -539,9 +582,14 @@ def _gallery_sync(limit: int, sid: str = DEFAULT_SESSION,
                     else "generated" if fn.startswith("gen_")
                     else "upload"
                 )
-                if kinds and kind not in kinds:      # ★ 截断前过滤（见 docstring）
-                    continue
-                items.append({
+                # ★★ kinds 过滤**故意不放这里**，而是在索引命中之后、
+                #   组装 items 时统一做。理由：索引是跨会话共享的，
+                #   若把"已按某会话的 kinds 筛过的结果"存进去，
+                #   A 会话筛 upload 就会污染 B 会话看到的结果。
+                #   索引只存**与 kinds 无关**的产物（kind 已是条目字段），
+                #   各会话在 items 上按 kind 自行过滤 ——
+                #   依然满足"过滤发生在截断之前"（截断在最后一行）。
+                entries.append({
                     "url": to_url(fp),
                     "filename": fn,
                     "kind": kind,
@@ -550,9 +598,49 @@ def _gallery_sync(limit: int, sid: str = DEFAULT_SESSION,
                         timespec="seconds"),
                     "subdir": rel_root.parent.as_posix(),
                 })
+            items.extend(entries)
+            _gallery_index_put(key, dirpath, candidates, entries)
+    if kinds:
+        # ★ 截断前过滤（见上面的注释）：先按 kind 筛，再排序、再截断
+        items = [x for x in items if x["kind"] in kinds]
     items.sort(key=lambda x: x["modified"], reverse=True)
     cap = max(1, min(limit, 500))
     return {"count": len(items[:cap]), "items": items[:cap]}
+
+
+# ★ 后缀白名单 —— 与旧版逐字一致，抽成常量只为让"筛后缀"与
+#   "索引里存什么"两处不会各写一份、改一处漏一处。
+_GALLERY_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
+
+# ★ 目录级扫描索引：{规范化目录路径: (目录 mtime_ns, 文件名元组, 条目列表)}
+#   条目里已经是**最终 dict**（含 url/kind/bytes/modified/subdir），
+#   所以命中时是直接 extend 复用，一次 stat、一个字符串比较都不用做。
+_gallery_index: dict[str, tuple[int, tuple, list]] = {}
+# ★ 索引容量上限。目录数量随会话数增长（每会话一个目录 + 日期子目录），
+#   不设上限就是内存泄漏 —— 公开版每个匿名访客都可能在 storage 下留目录。
+#   超限时**整体丢弃重建**，不做 LRU：判断"哪几个目录最常用"要额外维护
+#   命中顺序，而扫描本来就会被 15秒 TTL 缓存兜住，
+#   偶尔全量重建一次的代价远小于 LRU 的复杂度与出错风险。
+_GALLERY_INDEX_MAX_DIRS = 2000
+
+
+def _dir_mtime_ns(dirpath: str) -> int:
+    """取目录 mtime（纳秒）；读不到就返回 -1，逼迫调用方走重扫分支
+
+    读失败时**绝不能**返回"看起来没变"的值：那会让索引把一个
+    已经消失的目录当成有效，宁可多扫一次。
+    """
+    try:
+        return os.stat(dirpath).st_mtime_ns
+    except OSError:
+        return -1
+
+
+def _gallery_index_put(key: str, dirpath: str, names: tuple, entries: list) -> None:
+    """写入索引，并在超限时整体丢弃重建"""
+    if len(_gallery_index) >= _GALLERY_INDEX_MAX_DIRS:
+        _gallery_index.clear()
+    _gallery_index[key] = (_dir_mtime_ns(dirpath), names, entries)
 
 
 _GALLERY_TTL = 15.0          # 列表缓存秒数：仓库打开频繁、目录变化低频，短 TTL 足够

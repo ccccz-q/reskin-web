@@ -177,6 +177,8 @@ def run(
     user_message: str,
     *,
     thread_id: str = "default",
+    # ★ 额度账本键（与 thread_id 分开，见 ToolContext.quota_key 注释）
+    quota_key: str = "",
     image_path: str = "",
     image_info: dict | None = None,
     card: dict | None = None,
@@ -256,6 +258,7 @@ def run(
 
         ctx = ToolContext(
             thread_id=thread_id,
+            quota_key=quota_key or "",
             image_path=image_path,
             card=dict(card or {}),
             image_info=dict(image_info or {}),

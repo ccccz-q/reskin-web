@@ -205,6 +205,25 @@ REQUEST_TIMEOUT_SEC = int(os.getenv("REQUEST_TIMEOUT_SEC", "60"))
 # 模板工坊的分析类调用（逐图解构 / 视觉卡合成）用更短的超时 ——
 # 一次提炼有 9–11 次调用，统一 60s 会让整条链路变成"好几分钟"；分析类出不来就快速失败走降级路径。
 ANALYZE_TIMEOUT_SEC = int(os.getenv("ANALYZE_TIMEOUT_SEC", "45"))
+# ── 工坊提炼的阶段超时与整条链路硬闸（2026-10-07）────────────────
+#   ★ 为什么要加（评审自查 + 真机实测）：
+#     原来**只有文本降级路径**有超时（ANALYZE_TIMEOUT_SEC），
+#     VLM 看图那条主路径**完全不限时** —— 上游卡住时
+#     `ThreadPoolExecutor.map()` 会永远等，用户只看到"转圈到天荒地旧"。
+#     实测单图解构正常就要40–88s（并发 6 张时最慢那次 124s），
+#     所以阈值必须**按实测分布**给，不能拍脑袋给 30s。
+FORGE_VLM_TIMEOUT_SEC = int(os.getenv("FORGE_VLM_TIMEOUT_SEC", "150"))
+#   单图看图解构。给到 150s：实测最坏 124s，留 ~20% 余量。
+#   超时后果不是失败，而是**这张图降级**为"纯证据卡"（只用量出来的客观数据）。
+FORGE_COMPILE_TIMEOUT_SEC = int(os.getenv("FORGE_COMPILE_TIMEOUT_SEC", "180"))
+#   编译家族模板。实测 45s，180s 是 4 倍余量。
+FORGE_REPAIR_TIMEOUT_SEC = int(os.getenv("FORGE_REPAIR_TIMEOUT_SEC", "150"))
+#   单轮外科自修。实测约 70s。
+FORGE_TOTAL_BUDGET_SEC = int(os.getenv("FORGE_TOTAL_BUDGET_SEC", "360"))
+#   ★ 整条链路的硬闸（默认 6 分钟）。
+#   到点即停并**保留已产出的草稿** —— 用户已经等了 6 分钟，
+#   把编译好的东西扔掉让他重跑，比多等一会儿更糟。
+#   设 0 = 不设硬闸（不推荐）。
 # 逐图解构的并发度 —— 解构是 IO 密集（等模型返回），并行能显著降低总耗时。
 # ★ 提速专项（10-04）4→6：6 张参考图一批跑完（4 并发要两批），解构墙钟近乎减半；
 #   失败有文本解构降级路径兜底，并发压力可控。

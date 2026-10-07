@@ -17,6 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import services.context_store as cs  # noqa: E402
 from services import forge_spec_guard as guard      # noqa: E402
+import config                                                  # noqa: E402
+import services.llm as llm_mod                                # noqa: E402
+from services import style_forge as sf                         # noqa: E402
 
 cs.SQLITE_PATH = Path(tempfile.mkdtemp(prefix="forge_")) / "f.db"
 
@@ -444,6 +447,68 @@ for label, params, expect_min in [
 
 check("缺 params 键也不炸（按空处理）",
       isinstance(guard._normalize(dict(_base)).get("params"), dict))
+
+# ══════════════════════════════════════════════════════════
+# 阶段超时与整条链路硬闸（2026-10-07）
+# ══════════════════════════════════════════════════════════
+# ★ 为什么要有：原来**只有文本降级路径**有超时（ANALYZE_TIMEOUT_SEC），
+#   VLM 看图那条主路径完全不限时 —— 上游一卡，用户就是"转圈到天荒地旧"。
+#   这组断言守着三件事：阈值真的接上了、降级真的会走、预算到点不丢草稿。
+print("\n[测试 7] 阶段超时与总预算闸")
+import inspect as _inspect                              # noqa: E402
+
+check("config 里有VLM 单图超时且不小于实测最坏值(124s)",
+      config.FORGE_VLM_TIMEOUT_SEC >= 124,
+      f"{config.FORGE_VLM_TIMEOUT_SEC}s（实测并发 6 张时最慢一次 124.6s）")
+check("编译超时 >= 实测 45s 的 2 倍", config.FORGE_COMPILE_TIMEOUT_SEC >= 90,
+      f"{config.FORGE_COMPILE_TIMEOUT_SEC}s")
+check("自修轮超时 >= 实测 70s", config.FORGE_REPAIR_TIMEOUT_SEC >= 70,
+      f"{config.FORGE_REPAIR_TIMEOUT_SEC}s")
+check("总预算闸默认开启（>0）", config.FORGE_TOTAL_BUDGET_SEC > 0,
+      f"{config.FORGE_TOTAL_BUDGET_SEC}s")
+
+_vlm_src = _inspect.getsource(sf._vlm_json)
+check("★ _vlm_json 真的把 timeout 传给了 vision()",
+      "timeout=" in _vlm_src)
+_light_src = _inspect.getsource(sf._light_json)
+check("★ _light_json 真的把 timeout 传给了 chat()", "timeout=timeout" in _light_src)
+
+# 降级路径：把 vision 打超时，验证"这张图降级但整条链路不死"
+_orig_vision = llm_mod.vision
+try:
+    def _boom(*a, **k):
+        raise llm_mod.LLMError("模拟上游卡住（触发超时）")
+    llm_mod.vision = _boom
+    # 直接调内部路径：_decode_single 会捕获并降级
+    d = sf._decode_single("/nonexistent.png", None, {}, use_vlm=True, style_prompt="")
+    check("★ 上游卡住时该张图降级而不是抛异常", isinstance(d, dict), str(type(d)))
+except Exception as e:                                        # noqa: BLE001
+    check("★ 上游卡住时该张图降级而不是抛异常", False,
+          f"抛了 {type(e).__name__}: {e}")
+finally:
+    llm_mod.vision = _orig_vision
+
+# ── 中止与预算闸：必须**离线**验证，不许发真实调用 ──
+#★ 踩过的坑：第一版设FORGE_TOTAL_BUDGET_SEC=1 然后调 forge()，
+#   想"撞预算闸"—— 但预算闸是在**阶段之间**检查的，
+#   中间那两次意图解析（真实 LLM 调用）拦不住，
+#   于是测试真的花了 60 秒、真的调了两次 API。
+#   那��破坏了这个测试套件最核心的性质：**零真实调用**（README 里明写了）。
+#   现在改成：用 cancelled 探针（ forge 第一行就会问）验证中止路径，
+#   预算闸则用**源码静态断言**证明它接在 _stop() 上。
+res = sf.forge("任意风格", cancelled=lambda: True)
+check("cancelled 探针能立刻中止（离线，不发任何调用）",
+      bool(res.get("cancelled")), str(res)[:80])
+check("中止时不产出草稿（不冒充成功）", not res.get("spec"), str(res.get("spec"))[:60])
+
+_src = _inspect.getsource(sf.forge)
+check("★ 总预算闸接在中止探针 _stop() 里（全流程唯一探针，不会漏）",
+      "_deadline" in _src and "FORGE_TOTAL_BUDGET_SEC" in _src)
+check("★ 预算到点走「收尾」而非「取消」（草稿不丢）",
+      "if _stop() and not _budget_hit:" in _src)
+check("★ 预算到点会把实情写进 warnings（如实告知，不静悄悄）",
+      "_budget_hit:" in _src and "warnings.append(msg)" in _src)
+
 print()
 print(f"结果：{PASS} 通过 / {FAIL} 失败")
 sys.exit(1 if FAIL else 0)

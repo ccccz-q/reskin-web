@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -82,10 +83,41 @@ def ensure_within(path: Path, root: Path | str | None = None) -> Path:
       排查成本极高，必须让同一个模块只有一种口径。
     """
     resolved = Path(path).resolve()
-    root_resolved = Path(root or IMAGE_STORAGE_DIR).resolve()
+    root_resolved = _resolved_root(root)
     if resolved == root_resolved or root_resolved in resolved.parents:
         return resolved
     raise ValueError(f"路径越界：{path} 不在允许目录 {root_resolved} 内")
+
+
+# ★ 存储根的 resolve() 结果memo —— 因为它在一个进程内是**常量**。
+#   实测（2026-10-07 画廊压测）：Windows 上 `Path.resolve()` 要走
+#   GetFinalPathNameByHandle，**每个文件约 0.6ms**；画廊要给 831 个文件
+#   各拼一次 URL，于是光是"把根目录解析一遍"就重复了 831 次，
+#   实测占冷扫描 0.55s 里的约 0.28s —— 比真正的 stat 还贵。
+#   根只有一个，解析一次就够。
+#   ★ 为什么可以缓存：`resolve()` 的结果只取决于路径本身，
+#     而根目录在进程生命周期内不该变（测试要改也会先改
+#     `config.IMAGE_STORAGE_DIR`，key 随之变化 → 自然失效）。
+#   ★ 缓存 key 用「原始根字符串」而不是解析结果：这样运维改根目录时
+#     key 会变、缓存自动作废，不会拿旧根去校验新路径（那正好是
+#     ensure_within 注释里警告过的"两个目录长得毫不相干"）。
+_RESOLVED_ROOT_CACHE: dict[str, Path] = {}
+
+
+def _resolved_root(root: Path | str | None = None) -> Path:
+    """存储根的绝对化结果（进程内缓存）
+
+    相对路径**不缓存**：它的 resolve() 依赖进程 cwd，
+    而 cwd 在运行期可能被chdir 改变 —— 缓存下来就是一颗定时炸弹。
+    """
+    raw = str(root if root is not None else IMAGE_STORAGE_DIR)
+    if not os.path.isabs(raw):
+        return Path(raw).resolve()
+    cached = _RESOLVED_ROOT_CACHE.get(raw)
+    if cached is None:
+        cached = Path(raw).resolve()
+        _RESOLVED_ROOT_CACHE[raw] = cached
+    return cached
 
 
 def relative_key(path: Path, *, strict: bool = False) -> str:
@@ -99,7 +131,7 @@ def relative_key(path: Path, *, strict: bool = False) -> str:
       一个存到目录外的文件照样能拼出 /images/xxx.jpg 的 URL。
     """
     try:
-        return str(Path(path).resolve().relative_to(Path(IMAGE_STORAGE_DIR).resolve()))
+        return str(Path(path).resolve().relative_to(_resolved_root()))
     except ValueError:
         if strict:
             raise

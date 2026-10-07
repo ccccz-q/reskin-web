@@ -121,6 +121,43 @@ def session_dep(request: Request) -> str:
     return cached if isinstance(cached, str) and cached else resolve_session(request)
 
 
+# ── 额度账本键（与历史键刻意分开）───────────────────────────────
+#
+# ★ 为什么必须分开（2026-10-07 评审自查发现的真洞）
+#   `merge_thread` 在「没有 X-Session-Id」时会回退到**用户可控的 thread_id**。
+#   这对**历史隔离**没问题（它只是命名空间），但如果**配额账本也用它**，
+#   匿名请求换一个随机的 thread_id 就能拿到一份全新额度 ——
+#   MAX_GENERATIONS_PER_SESSION 这道成本护栏等于形同虚设，
+#   而它恰恰是保护 API 花费的那道闸。
+#
+#   所以引入独立的 quota_key：
+#     · 有身份 → 用 sid（不可伪造，因为要凭空猜中别人的 128 位 UUID）
+#     · 无身份 → 用**服务端推导的客户端指纹**（IP + UA 的哈希），
+#       用户能伪造 thread_id，但伪造不了自己连上来的 IP。
+#   代价（诚实记录）：同一 NAT 出口后的多个访客会共享配额。
+#   这是"防绕过"与"公平计量"之间的取舍，我选了前者 ——
+#   护栏失效是**真金白银**的损失，而 NAT 共享只影响极端部署形态。
+def quota_key(explicit: str | None, sid: str, request) -> str:
+    """额度账本键。**不要**用 merge_thread 的结果当配额键（见上方注释）。"""
+    if sid != DEFAULT_SESSION:
+        return sid
+    try:
+        from starlette.requests import Request  # noqa: F401  （仅类型友好）
+        client = getattr(request, "client", None)
+        ip = getattr(client, "host", "") or "unknown"
+    except Exception:                                    # noqa: BLE001
+        ip = "unknown"
+    ua = ""
+    try:
+        ua = (request.headers.get("user-agent") or "")[:120]
+    except Exception:                                    # noqa: BLE001
+        pass
+    import hashlib
+
+    raw = f"{ip}|{ua}".encode("utf-8", "replace")
+    return "anon:" + hashlib.sha256(raw).hexdigest()[:16]
+
+
 def merge_thread(explicit: str | None, sid: str) -> str:
     """header 会话优先；旧前端没带 X-Session-Id 时回退 body/query 的 thread_id。
 

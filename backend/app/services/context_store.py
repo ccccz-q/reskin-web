@@ -46,6 +46,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import SQLITE_PATH                                  # noqa: E402
+import infra.counters as _counters                              # noqa: E402
 from infra.logging import audit, logger                          # noqa: E402
 
 # 长期记忆文件也归到统一的 STORAGE_DIR 下（旧版散在 backend/storage）
@@ -314,7 +315,10 @@ _db_lock = threading.Lock()
 # 撞 SQLITE_BUSY 再等 timeout，不如在应用侧直接排队 —— 更快也更可预测。
 # 实测副产品：受限环境（沙箱 / 只读挂载）下 WAL 的 -shm 拿不到时，
 # 并发写会报 "attempt to write a readonly database"，串行化后连带规避。
-_write_lock = threading.Lock()
+# ★ 这把锁与 `infra.counters.write_lock` 是**同一个对象**。
+#   治理层的计数/票据表已下沉到 infra，但它们与消息表写在同一个库文件里；
+#   两边各持一把锁就等于没串行，并发写会真的撞上 "database is locked"。
+_write_lock = _counters.write_lock
 # ★ 记住「已经为哪个路径初始化过」。只记布尔值是不够的：
 #   测试常常先 import 再改 cs.SQLITE_PATH 指向临时库，
 #   如果只看 bool，init_db() 会直接返回 → 临时库里根本没有表
@@ -379,6 +383,12 @@ def init_db(force: bool = False) -> None:
             conn.commit()
         finally:
             conn.close()
+        # ★ 治理层的两张表已下沉到 infra.countors，它按路径记住"建过表"。
+        #   这里必须同步清掉它的记忆 —— 否则测试把 SQLITE_PATH 指向一个
+        #   全新临时库时，infra 会以为表已存在而跳过 DDL，
+        #   紧接着的计数器调用就报 "no such table: session_counter"。
+        #   （与上面 _initialized_for 用路径而非 bool 是同一个坑。）
+        _counters.forget_initialized(SQLITE_PATH)
         _initialized_for = SQLITE_PATH
 
 
@@ -801,34 +811,27 @@ def all_summaries(limit: int = 5) -> list[dict]:
 
 
 # ─────────────────────── 会话计数器 ───────────────────────
+#
+# ★ 实现已下沉到 `infra/counters`（见那里的分层说明）。
+#   这里保留同名函数作为**门面**：一是 `from services.context_store import
+#   bump_counter` 的调用方一个都不用改，二是 `cs.SQLITE_PATH` 被测试改写
+#   时依然生效 —— 门面把当前路径显式传下去，而不是让下层自己去读全局。
+#   治理层则直接调 `infra.counters`，两条路共用同一张表、同一把写锁。
 
 def bump_counter(key: str, delta: int = 1) -> int:
     """原子自增，返回新值（用于「本会话已生成几张」这类治理计数）"""
     init_db()
-    now = datetime.now().isoformat(timespec="seconds")
-    with _write_lock, _open() as conn:
-        conn.execute(
-            "INSERT INTO session_counter(key, value, updated) VALUES(?,?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=value+?, updated=excluded.updated",
-            (key, delta, now, delta),
-        )
-        row = conn.execute(
-            "SELECT value FROM session_counter WHERE key=?", (key,)
-        ).fetchone()
-    return int(row["value"]) if row else 0
+    return _counters.bump_counter(key, delta, db=SQLITE_PATH)
 
 
 def get_counter(key: str) -> int:
     init_db()
-    with _open() as conn:
-        row = conn.execute("SELECT value FROM session_counter WHERE key=?", (key,)).fetchone()
-    return int(row["value"]) if row else 0
+    return _counters.get_counter(key, db=SQLITE_PATH)
 
 
 def reset_counter(key: str) -> None:
     init_db()
-    with _write_lock, _open() as conn:
-        conn.execute("DELETE FROM session_counter WHERE key=?", (key,))
+    _counters.reset_counter(key, db=SQLITE_PATH)
 
 
 # ─────────────── 额度预扣票据（治理层用）───────────────
@@ -844,61 +847,34 @@ def reset_counter(key: str) -> None:
 
 def add_reservation(token: str, thread_id: str) -> None:
     init_db()
-    now = datetime.now().isoformat(timespec="seconds")
-    with _write_lock, _open() as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO reservations(token, thread_id, ts) VALUES(?,?,?)",
-            (token, thread_id, now),
-        )
+    _counters.add_reservation(token, thread_id, db=SQLITE_PATH)
 
 
 def consume_reservation(token: str) -> bool:
     """兑现票据（一次性）。返回 True 表示这张票之前确实存在。
 
-    用 DELETE 的 rowcount 做原子判定 —— 不要先 SELECT 再 DELETE，
+    原子性由 `infra.counters.consume_reservation` 里的
+    DELETE rowcount 判定保证 —— 不要先 SELECT 再 DELETE，
     那中间会被并发请求插进来，导致同一张票被兑现两次。
     """
     init_db()
-    with _write_lock, _open() as conn:
-        cur = conn.execute("DELETE FROM reservations WHERE token=?", (token,))
-        return (cur.rowcount or 0) > 0
+    return _counters.consume_reservation(token, db=SQLITE_PATH)
 
 
 def peek_reservation(token: str) -> dict | None:
     init_db()
-    with _open() as conn:
-        row = conn.execute(
-            "SELECT token, thread_id, ts FROM reservations WHERE token=?", (token,)
-        ).fetchone()
-    return dict(row) if row else None
+    return _counters.peek_reservation(token, db=SQLITE_PATH)
 
 
 def list_reservations(older_than_sec: int | None = None) -> list[dict]:
-    """列出未兑现的票据；给了 older_than_sec 就只返回超过该年龄的"""
+    """列出未兑现的票据；给了older_than_sec 就只返回超过该年龄的"""
     init_db()
-    with _open() as conn:
-        rows = conn.execute(
-            "SELECT token, thread_id, ts FROM reservations ORDER BY ts"
-        ).fetchall()
-    out = [dict(r) for r in rows]
-    if older_than_sec is None:
-        return out
-    cutoff = datetime.now().timestamp() - older_than_sec
-    stale = []
-    for r in out:
-        try:
-            if datetime.fromisoformat(r["ts"]).timestamp() < cutoff:
-                stale.append(r)
-        except (ValueError, TypeError):
-            stale.append(r)          # 时间戳解析不了的一律当残票
-    return stale
+    return _counters.list_reservations(older_than_sec, db=SQLITE_PATH)
 
 
 def reservations_stats() -> dict:
     init_db()
-    with _open() as conn:
-        row = conn.execute("SELECT COUNT(*) c FROM reservations").fetchone()
-    return {"pending": int(row["c"]) if row else 0}
+    return _counters.reservations_stats(db=SQLITE_PATH)
 
 
 # ─────────────────────── 维护 ───────────────────────

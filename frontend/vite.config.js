@@ -25,5 +25,11 @@ export default defineConfig(({ mode }) => {
       },
     },
     build: { outDir: 'dist', sourcemap: false },
+    // 纯函数单测：只测src/lib 与 api 的纯逻辑，用 Node 环境即可（不需要 DOM），
+    // 所以不装 jsdom / testing-library。
+    test: {
+      environment: 'node',
+      include: ['src/**/*.test.js'],
+    },
   }
 })

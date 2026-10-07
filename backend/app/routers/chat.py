@@ -41,7 +41,12 @@ from governance.guard import GovernanceError, policy_snapshot, reset_quota   # n
 from infra.logging import logger                                             # noqa: E402
 from infra import tasks                                                      # noqa: E402
 from services import context_store                                           # noqa: E402
-from services.identity import merge_thread, session_dep                      # noqa: E402
+from services.identity import (                                          # noqa: E402
+    DEFAULT_SESSION,
+    merge_thread,
+    quota_key,
+    session_dep,
+)
 from services.upload import validate_and_save                                # noqa: E402
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -106,8 +111,12 @@ class AgentOut(BaseModel):
 # ─────────────────────────── 对话 ───────────────────────────
 
 @router.post("", response_model=AgentOut, summary="与 Agent 对话（自建 Tool-use Loop）")
-async def chat(req: ChatRequest, sid: str = Depends(session_dep)) -> dict:
+async def chat(req: ChatRequest, request: Request,
+              sid: str = Depends(session_dep)) -> dict:
     tid = merge_thread(req.thread_id, sid)   # ★ 公开版：header 会话优先
+    # ★ 配额账本键与历史键**必须分开**：merge_thread 的回退分支用的是
+    #   用户可控的 thread_id，拿它当配额键等于「换个 id 就绕过额度」。
+    qkey = quota_key(req.thread_id, sid, request)
     try:
         # ★ run_agent 里是同步的 Agent 循环（最多 8 步 × LLM 调用），
         #   直接放进 async def 会冻结事件循环 —— 必须丢线程池。
@@ -115,6 +124,7 @@ async def chat(req: ChatRequest, sid: str = Depends(session_dep)) -> dict:
             run_agent,
             req.message,
             thread_id=tid,
+            quota_key=qkey,
             image_url=req.image_url,
             card=req.card,
             allow_spend=req.allow_spend,
@@ -456,7 +466,22 @@ async def get_policy(thread_id: str = "default",
 
 
 @router.post("/reset-quota", summary="重置某个会话的生成额度")
-async def reset(thread_id: str = "default",
+async def reset(thread_id: str = "default", request: Request = None,
                 sid: str = Depends(session_dep)) -> dict:
-    tid = merge_thread(thread_id, sid)
-    return {"thread_id": tid, "quota": reset_quota(tid)}
+    """重置**自己**的生成额度
+
+    ★ 2026-10-07 修掉的越权（评审自查发现）：
+      原来 `tid = merge_thread(thread_id, sid)`，而它在**没有身份**时会回退到
+      **用户可控的 thread_id** —— 于是匿名请求带上别人的 thread_id 就能把
+      别人的额度清零。虽然它只是"成本护栏"、不是安全边界（改了也不该被当
+      权限系统用），但**能被别人清零**本身就是缺陷。
+      现在：无身份一律拒绝 —— 「重置我的额度」这件事需要先知道"我是谁"。
+    """
+    qkey = quota_key(thread_id, sid, request)
+    if qkey.startswith("anon:") and sid == DEFAULT_SESSION:
+        raise HTTPException(
+            403,
+            {"code": "no_identity",
+             "message": "缺少会话标识，无法重置额度。请让页面重新加载后再试，"
+                        "或改用「退出登录」后重新进入。"})
+    return {"thread_id": qkey, "quota": reset_quota(qkey)}

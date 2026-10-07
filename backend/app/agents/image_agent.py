@@ -94,6 +94,9 @@ def run_agent(
     message: str,
     *,
     thread_id: str = "default",
+    # ★ 额度账本键（与 thread_id 分开，见 ToolContext.quota_key 注释）。
+    #   空 = 沿用 thread_id（保持旧调用与旧测试行为不变）。
+    quota_key: str = "",
     image_url: str = "",
     card: dict | None = None,
     allow_spend: bool = True,
@@ -151,6 +154,7 @@ def run_agent(
         result: AgentRunResult = _run(
             message,
             thread_id=tid,
+            quota_key=quota_key,
             image_path=image_path,
             image_info=image_info,
             card=card,

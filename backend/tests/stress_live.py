@@ -225,3 +225,97 @@ else:
     print("    所有场景 p95 < 2s")
 print(f"    服务端在压测期间未崩溃、未返回 5xx（除上表列出的）")
 sys.exit(1 if (total_err / max(1, total_req) > 0.02) else 0)
+# ══════════════════════════════════════════════════════════
+# 追加场景（2026-10-07）：长稳+ 弱网 + 慢客户端
+# ══════════════════════════════════════════════════════════
+# ★ 为什么补这三类（评审自查指出压测只测了"瞬时并发"）
+#   瞬时并发只回答"峰值扛不扛得住"。线上真正出事的三种形态是：
+#     ① 长稳：跑几小时后内存/句柄/线程有没有单调上涨（泄漏）
+#     ② 弱网：客户端慢 → SSE 队列积压 → 关键事件被丢（这正是我们改过的点）
+#     ③ 慢客户端：不读响应体 → 服务端缓冲区堆积
+#   这三类都不是"并发数字"能暴露的，必须单独测。
+print()
+print("=" * 78)
+print("[6] 长稳：连续请求下的资源单调性（查泄漏）")
+print("=" * 78)
+
+
+def _server_snapshot() -> tuple[int, float]:
+    """取服务进程的线程数与常驻内存（Windows 用 tasklist 拿峰值内存不行，
+    这里读 /api/health 的响应头拿不到 —— 改用 psutil 不可靠时返回 0）"""
+    try:
+        import psutil  # type: ignore
+        for p in psutil.process_iter(["name", "cmdline"]):
+            cl = p.info.get("cmdline") or []
+            if any("uvicorn" in str(c) for c in cl):
+                return p.num_threads(), p.memory_info().rss / 1024 / 1024
+    except Exception:                                       # noqa: BLE001
+        pass
+    return 0, 0.0
+
+
+BASE_URL = BASE
+samples = []
+for round_i in range(6):
+    for path in ("/api/health", "/api/families", "/api/image/gallery?limit=8"):
+        call("GET", path, sid=f"soak-{round_i}")
+    th, mem = _server_snapshot()
+    samples.append((th, mem))
+    print(f"    第 {round_i + 1} 轮：线程 {th or '—'}，内存 {mem:.1f} MB"
+          if mem else f"    第 {round_i + 1} 轮：线程 {th or '—'}，内存（未装 psutil，跳过）")
+if len(samples) >= 2 and samples[-1][1] > 0:
+    grew = samples[-1][1] - samples[0][1]
+    verdict = "平稳" if grew < 20 else ("可疑增长" if grew < 60 else "★ 疑似泄漏")
+    print(f"    内存净增{grew:+.1f} MB → {verdict}")
+    print("    （判定基线：6 轮 × 3 请求的净增<20MB 视为正常，进程启动期的"
+          "一次性预热不计）")
+else:
+    print("    → 未装 psutil，本项只做功能压测；资源快照需在部署环境补测")
+
+print()
+print("=" * 78)
+print("[7] 弱网/ 慢客户端：SSE 队列会不会积压到丢关键事件")
+print("=" * 78)
+# 做法：开一条 SSE 流，**故意不读**，等它把队列填起来，再正常读一遍，
+# 检查 image/done 这类关键事件是否还在（这是 2026-10-07 刚修的逻辑）。
+try:
+    req = urllib.request.Request(
+        BASE + "/api/chat/stream",
+        data=json.dumps({"message": "你好", "thread_id": "slow-client-probe",
+                         "allow_spend": False}).encode(),
+        headers={"Content-Type": "application/json",
+                 "X-Session-Id": "slow-client-probe"},
+        method="POST")
+    t0 = time.perf_counter()
+    resp = OPENER.open(req, timeout=30)          # 故意不读 body
+    print(f"    已建立 SSE 连接（{time.perf_counter() - t0:.1f}s 内），"
+          "现在**不读**响应体，模拟慢客户端…")
+    time.sleep(6)
+    got = resp.read().decode("utf-8", "replace")
+    events = [ln[6:].strip() for ln in got.splitlines()
+              if ln.startswith("event:")]
+    critical = [e for e in events if e in ("image", "done", "close", "error")]
+    print(f"    收到事件 {len(events)} 个：{events[:10]}")
+    check_ok = ("close" in events) or ("done" in events)
+    print(f"    关键事件（close/done）是否保全：{'是' if check_ok else '★否（说明队列丢关键事件）'}")
+    resp.close()
+except Exception as e:                                       # noqa: BLE001
+    print(f"    ★ 慢客户端探测失败：{type(e).__name__}: {str(e)[:120]}")
+    print("      （若网关不支持长连接，这项应改为在部署环境用真实弱网重测）")
+
+print()
+print("=" * 78)
+print("[8] 已知未覆盖项（如实列出，不假装测到了）")
+print("=" * 78)
+for item in [
+    "多worker / 多进程部署：治理层的 threading.Lock 只在单进程内有效，"
+    "多 worker 下会失效 —— 本项目当前是**单进程部署**，所以现状安全；"
+    "若将来横向扩展，必须先把配额计数挪到数据库层（用带条件的 UPDATE 实现原子扣减）",
+    "长稳（>30 分钟持续压力）：本轮只做了 6 轮功能压测，"
+    "未做30 分钟以上的持续压测 —— 泄漏类问题需要那种时长才暴露",
+    "真实弱网（丢包/抖动）：第 [7] 项只模拟了「客户端读得慢」，"
+    "没有模拟网络层丢包与 RTT 抖动",
+    "数据库故障演练（磁盘满 / 只读 / 文件锁死）：test_concurrency.py 覆盖了"
+    "「文件损坏」，但没覆盖「磁盘满」",
+]:
+    print(f"    · {item}")

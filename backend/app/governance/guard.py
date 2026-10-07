@@ -35,9 +35,7 @@ from config import (                                             # noqa: E402
     MAX_GENERATIONS_PER_SESSION,
     MAX_UPLOAD_BYTES,
 )
-from infra.logging import audit, logger                           # noqa: E402
-from infra.storage import ensure_within                           # noqa: E402
-from services.context_store import (                                     # noqa: E402
+from infra.counters import (                                           # noqa: E402
     add_reservation,
     bump_counter,
     consume_reservation,
@@ -45,6 +43,8 @@ from services.context_store import (                                     # noqa:
     list_reservations,
     reset_counter,
 )
+from infra.logging import audit, logger                           # noqa: E402
+from infra.storage import ensure_within                           # noqa: E402
 
 
 class GovernanceError(Exception):

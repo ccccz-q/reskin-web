@@ -56,10 +56,10 @@ print("=== 1. Origin 白名单：模拟恶意网页 ===")
 GOOD = "http://localhost:5173"
 BAD = "https://evil.com"
 
-r = client.post(f"/api/chat/reset-quota?thread_id=t", headers={"Origin": GOOD})
+r = client.post(f"/api/chat/reset-quota?thread_id=t", headers={"Origin": GOOD, "X-Session-Id": "a1a1a1a1bbbb4cccc8ddd4eeee5ffff6"})
 check("白名单内的来源放行", r.status_code == 200, str(r.status_code))
 
-r = client.post(f"/api/chat/reset-quota?thread_id=t", headers={"Origin": BAD})
+r = client.post(f"/api/chat/reset-quota?thread_id=t", headers={"Origin": BAD, "X-Session-Id": "b1b1b1b1bbbb4cccc8ddd4eeee5ffff6"})
 check("★ 恶意网页被挡 403", r.status_code == 403, str(r.status_code))
 check("给的是结构化错误码", r.json().get("code") == "origin_denied", str(r.json())[:90])
 
@@ -76,14 +76,14 @@ print()
 print("=== 2. 所有写方法都设闸 ===")
 for method, path in [("DELETE", "/api/chat/history?thread_id=t"),
                      ("POST", "/api/image/render")]:
-    r = client.request(method, path, headers={"Origin": BAD}, json={})
+    r = client.request(method, path, headers={"Origin": BAD, "X-Session-Id": "b1b1b1b1bbbb4cccc8ddd4eeee5ffff6"}, json={})
     check(f"{method} {path.split('?')[0]} 被挡", r.status_code == 403, str(r.status_code))
 
 print()
 print("=== 3. 只读请求完全不受影响 ===")
 for path in ("/api/health", "/api/families", "/api/chat/policy?thread_id=t",
              "/api/templates", "/api/sources", "/api/inventory"):
-    r = client.get(path, headers={"Origin": BAD})
+    r = client.get(path, headers={"Origin": BAD, "X-Session-Id": "b1b1b1b1bbbb4cccc8ddd4eeee5ffff6"})
     check(f"GET {path.split('?')[0]} 仍 200", r.status_code == 200, str(r.status_code))
 
 print()
@@ -106,14 +106,16 @@ for headers, expect, note in [
     ({"X-Local-Token": "wrong"}, 401, "错令牌"),
     ({"X-Local-Token": "secrettoken123"}, 200, "正确令牌"),
 ]:
-    r = client2.post("/api/chat/reset-quota?thread_id=t", headers=headers)
+    r = client2.post("/api/chat/reset-quota?thread_id=t",
+                     headers={**headers, "X-Session-Id": "e1e1e1e1bbbb4cccc8ddd4eeee5ffff6"})
     check(f"{note} → {expect}", r.status_code == expect, str(r.status_code))
 check("快照报告 token_required=true",
       client2.get("/api/health").json()["security"]["token_required"] is True)
 check("★ Origin 闸在令牌模式下依然生效（两道闸独立）",
       client2.post("/api/chat/reset-quota?thread_id=t",
                    headers={"Origin": BAD,
-                            "X-Local-Token": "secrettoken123"}).status_code == 403)
+                            "X-Local-Token": "secrettoken123",
+                            "X-Session-Id": "f1f1f1f1bbbb4cccc8ddd4eeee5ffff6"}).status_code == 403)
 config.LOCAL_TOKEN = ""
 client = fresh_client()
 
@@ -270,7 +272,8 @@ for label, hdrs in [
     check(f"重复 Origin（{label}）→ 403", r.status_code == 403, str(r.status_code))
 
 r = client.post("/api/chat/reset-quota?thread_id=t",
-                headers={"Origin": "http://localhost:5173/"})
+                headers={"Origin": "http://localhost:5173/",
+                         "X-Session-Id": "a2a2a2a2bbbb4cccc8ddd4eeee5ffff6"})
 check("尾斜杠归一后放行", r.status_code == 200, str(r.status_code))
 
 print()

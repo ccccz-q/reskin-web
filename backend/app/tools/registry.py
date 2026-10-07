@@ -56,6 +56,12 @@ class ToolContext:
     加一个新工具要传新参数时，类型系统 remnant 会提醒我漏了哪一处。
     """
     thread_id: str = "default"
+    # ★ 额度账本键，**刻意与 thread_id 分开**（2026-10-07）。
+    #   thread_id 负责历史命名空间（无身份时可回退到用户传的值，那是设计）；
+    #   但配额是**真金白银**的护栏，绝不能挂在用户可控的键上 ——
+    #   否则换个 thread_id 就能绕过 MAX_GENERATIONS_PER_SESSION。
+    #   空 = 沿用 thread_id（保持旧调用与旧测试的行为不变）。
+    quota_key: str = ""
     image_path: str = ""
     card: dict = field(default_factory=dict)
     image_info: dict = field(default_factory=dict)
@@ -334,7 +340,7 @@ def tool_generate_image(args: dict, ctx: ToolContext) -> dict:
     # ★ 权限判断 + 额度占位统一在治理层 —— 工具本身不判断
     #   且必须是「预扣」而非「只看不写」：否则并发两个请求会同时通过检查。
     try:
-        token = reserve_generation(ctx.thread_id, reference_image=ctx.image_path)
+        token = reserve_generation(ctx.quota_key or ctx.thread_id, reference_image=ctx.image_path)
     except GovernanceError as e:
         audit("generate_denied", thread_id=ctx.thread_id, code=e.code, **e.extra)
         return {
@@ -349,7 +355,7 @@ def tool_generate_image(args: dict, ctx: ToolContext) -> dict:
     #   raise ValueError（尺寸非法 / 上游返回体缺字段），那条路径**一个
     #   release 都没有** —— 工具以异常终止，Agent 看到的是"工具崩了"，
     #   额度却一直被扣着。现在 finally 一道兜住，新增异常类型也不漏。
-    quota_guard = new_generation_guard(ctx.thread_id, token,
+    quota_guard = new_generation_guard(ctx.quota_key or ctx.thread_id, token,
                                        reference_image=ctx.image_path)
     try:
         built = safe_build(family_id, params, ctx.card,
@@ -528,7 +534,7 @@ def tool_repair_image(args: dict, ctx: ToolContext) -> dict:
 
     # 权限与额度：与 generate_image 同一套预扣 → 结算/退还
     try:
-        token = reserve_generation(ctx.thread_id, reference_image=last_image)
+        token = reserve_generation(ctx.quota_key or ctx.thread_id, reference_image=last_image)
     except GovernanceError as e:
         audit("repair_denied", thread_id=ctx.thread_id, code=e.code, **e.extra)
         return {
@@ -541,7 +547,7 @@ def tool_repair_image(args: dict, ctx: ToolContext) -> dict:
         change, build_repair_constraints(ctx.extra_prompt,
                                          str(ctx.artifacts.get("family_id") or "")))
     # ★ 与 generate_image 同一套归还保证（幂等 + finally）
-    quota_guard = new_generation_guard(ctx.thread_id, token,
+    quota_guard = new_generation_guard(ctx.quota_key or ctx.thread_id, token,
                                        reference_image=last_image)
     try:
         with step("Agent 修复出图", thread=ctx.thread_id, change=change[:40]):

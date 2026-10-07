@@ -73,7 +73,7 @@ export function thumbSrc(url, w = 320) {
  *   改一次文案要改4 处，漏一处就出现「同一个错误两种说法」。
  *   注意后端 detail 可能是字符串也可能是 {message}，两种都得认。
  */
-async function throwResponseError(resp, fallback) {
+export async function throwResponseError(resp, fallback) {
   let msg = fallback
   try {
     const b = await resp.json()

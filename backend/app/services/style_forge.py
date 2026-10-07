@@ -81,6 +81,10 @@ from concurrent.futures import ThreadPoolExecutor  # noqa: E402
 
 from config import (  # noqa: E402
     ANALYZE_TIMEOUT_SEC,
+    FORGE_COMPILE_TIMEOUT_SEC,
+    FORGE_REPAIR_TIMEOUT_SEC,
+    FORGE_TOTAL_BUDGET_SEC,
+    FORGE_VLM_TIMEOUT_SEC,
     FORGE_DECODE_WORKERS,
     FORGE_MAX_IMAGES,
 )
@@ -138,7 +142,8 @@ def _strip_fence(text: str) -> str:
     return s.strip()
 
 
-def _vlm_json(image_path: str, system: str, extra: str = "") -> dict:
+def _vlm_json(image_path: str, system: str, extra: str = "",
+               timeout: float | None = None) -> dict:
     """用视觉模型对单张图做结构化分析。任何失败都返回 {} —— 调用方会退回降级路径。"""
     from config import VISION_MODEL
     if not VISION_MODEL:
@@ -160,6 +165,10 @@ def _vlm_json(image_path: str, system: str, extra: str = "") -> dict:
                 max_tokens=2000,
                 temperature=0.3,
                 response_format={"type": "json_object"},
+                # ★ 阶段超时（2026-10-07）：此前主路径**完全不限时**，
+                #   上游卡住就是无限等。超时抛 LLMError → 上面 except 收{} →
+                #   这张图降级为纯证据卡，其余图照常，**整条链路不会死**。
+                timeout=timeout if timeout is not None else FORGE_VLM_TIMEOUT_SEC,
             )
         return extract_json(_strip_fence(text)) or {}
     except Exception as e:
@@ -574,7 +583,12 @@ def _compile(card: dict, intent: str, base: dict | None,
     raw = chat([{"role": "system", "content": _COMPILE_SYSTEM},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
                temperature=0.55, max_tokens=2600, premium=True,
-               response_format={"type": "json_object"})
+               response_format={"type": "json_object"},
+               # ★ 阶段超时（2026-10-07）：此前编译无时限，上游卡住就是无限等。
+               #   实测编译 45s，给到 180s（4 倍余量）只为防上游异常，
+               #   **不是为了赶时间** —— 超时的后果是"这次提炼失败"，
+               #   不会降级出低质量草稿（QC 仍然是唯一的质量门）。
+               timeout=FORGE_COMPILE_TIMEOUT_SEC)
     return extract_json(_strip_fence(raw)) or {}
 
 
@@ -583,7 +597,8 @@ def _compile(card: dict, intent: str, base: dict | None,
 _WORLD_SYSTEM = _load_prompt("forge_world.md")   # 外置资产：templates/prompts/forge_world.md
 
 
-def _light_json(system: str, text: str, max_tokens: int = 900) -> dict:
+def _light_json(system: str, text: str, max_tokens: int = 900,
+                timeout: float | None = None) -> dict:
     """轻量结构化意图调用（低温度 + JSON 模式）。任何异常返回 {} —— 意图层
     的小调用绝不允许阻塞提炼主链。_detect_world / _parse_positive 共用。
 
@@ -595,7 +610,8 @@ def _light_json(system: str, text: str, max_tokens: int = 900) -> dict:
         raw = chat([{"role": "system", "content": system},
                     {"role": "user", "content": text[:4000]}],
                    temperature=0.1, max_tokens=max_tokens,
-                   response_format={"type": "json_object"})
+                   response_format={"type": "json_object"},
+                   timeout=timeout)
         return extract_json(_strip_fence(raw)) or {}
     except LLMError as e:
         logger.warning("轻量意图调用失败（按未命中处理）：%s", e)
@@ -747,9 +763,24 @@ def forge(
 
     def _stop() -> bool:
         try:
-            return bool(cancelled and cancelled())
+            if cancelled and cancelled():
+                return True
         except Exception:
-            return False
+            pass
+        # ★ 整条链路硬闸（2026-10-07）：到点就当"中止"处理。
+        #   为什么接在 _stop() 而不是各阶段各判一次：_stop() 是全流程**唯一**
+        #   的中止探针（解构前后、合成前、编译前、自修轮都会问），
+        #   接在这里 = 一处改动覆盖所有阶段，不会漏。
+        if _deadline is not None and time.time() > _deadline:
+            _budget_hit = True
+            logger.warning("提炼超过总预算 %.0fs，提前收尾（已产出的草稿会保留）",
+                           FORGE_TOTAL_BUDGET_SEC)
+            return True
+        return False
+
+    # 预算闸在started 赋值后再计算，所以先声明
+    _deadline: float | None = None
+    _budget_hit = False
 
     paths = [p for p in (image_paths or []) if p and os.path.exists(p)]
     if not paths and not (theory or "").strip() and not (style_prompt or "").strip():
@@ -758,6 +789,8 @@ def forge(
         return dict(_CANCELLED)
 
     started = time.time()
+    if FORGE_TOTAL_BUDGET_SEC > 0:
+        _deadline = started + FORGE_TOTAL_BUDGET_SEC
 
     # ★ 证据一律走本地客观测量（色板/明度/朝向，便宜且真实）。
     #   看图只发生在下面的解构阶段 —— 之前两张阶段各看一次，配了视觉模型后等于每张图看两遍。
@@ -926,6 +959,7 @@ def forge(
                 {"role": "user", "content": _REPAIR_TMPL.format(
                     errors="\n".join(f"- {e}" for e in errors[:3]))},
             ], temperature=0.2, max_tokens=2600, premium=True,
+            timeout=FORGE_REPAIR_TIMEOUT_SEC,
                response_format={"type": "json_object"})
             fixed = extract_json(_strip_fence(repair))
             if isinstance(fixed, dict) and fixed:
@@ -935,8 +969,19 @@ def forge(
             logger.warning("自修轮 %d 调用失败：%s", rounds, e)
             break
 
-    if _stop():                        # 自修轮期间被中止 → 明确标记，不冒充校验失败
+    # ★ 预算到点 vs 用户主动中止，要区别对待（2026-10-07）
+    #   用户主动中止 → 草稿他不要了，返回取消是对的。
+    #   **预算到点** → 草稿已经编译好了（可能还过了 QC），
+    #     这时候把它扔掉、让用户重跑 3 分钟，是最糟的处理。
+    #     所以：预算到点且手上已有可用 doc，就**继续往下走**，
+    #     只把"跳过了自修轮"记进 warnings，如实告诉用户。
+    if _stop() and not _budget_hit:
         return {**dict(_CANCELLED), "card": card}
+    if _budget_hit:
+        msg = (f"提炼用了 {round(time.time() - started)} 秒，已超过本次的时间预算，"
+               "就到这里收尾（可以点「继续迭代」接着改）")
+        logger.info(msg)
+        warnings.append(msg)
 
     elapsed = round(time.time() - started, 2)
     # 分段耗时：用户问"为什么提炼好几分钟"时，能直接看出慢在解构还是编译。
