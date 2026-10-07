@@ -100,6 +100,24 @@ export default function App() {
     return () => { dead = true; clearInterval(timer) }
   }, [])
 
+  // ── 全局提示（toast）────────────────────────────────────────
+  // ★ 定义必须排在**所有使用它的 hook 之前**（2026-10-07 修的真实故障）。
+  //   症状：登录后整页崩进ErrorBoundary，报
+  //   `ReferenceError: Cannot access 'flash' before initialization`。
+  //   原因：拆分时useGallery/useFamilies 被放到前面，而 flash 的 const 留在原处，
+  //   于是**渲染还没走到定义那行**就先读了它 —— const 的 TDZ（暂时性死区）。
+  //   之前它定义在下方时 JS 函数作用域提升能兜住，改成 const 箭头函数后兜不住了。
+  //   为什么 build 与 lint 都没报：这是**运行时**错误，静态检查看不见。
+  //   为什么 179 个单测也没抓到：它们测的是 lib/ 里的纯函数，不渲染 App。
+  const flash = useCallback((msg) => {
+    if (!aliveRef.current) return
+    setToast(msg)
+    // 存 timer id：新提示会覆盖旧提示的关闭时机，
+    // 否则连点三处错误，三秒后被第一个 timer 提前清掉后两条还在
+    clearTimeout(toastTimer.current)
+    toastTimer.current = setTimeout(() => setToast((cur) => (cur === msg ? '' : cur)), 3200)
+  }, [])
+
   // ── 作品浏览（最近生成 / 灯箱 / 下载）──────────────────────
   const {
     recent, lightbox, openLightbox, closeLightbox,
@@ -118,15 +136,6 @@ export default function App() {
       // 重则把已经卸载的 toast 又改回去（用户看到「凭空又弹一次」）
       clearTimeout(toastTimer.current)
     }
-  }, [])
-
-  const flash = useCallback((msg) => {
-    if (!aliveRef.current) return
-    setToast(msg)
-    // 存timer id：新提示会覆盖旧提示的关闭时机，
-    // 否则连点三处错误，三秒后被第一个 timer 提前清掉后两条还在
-    clearTimeout(toastTimer.current)
-    toastTimer.current = setTimeout(() => setToast((cur) => (cur === msg ? '' : cur)), 3200)
   }, [])
 
   // ── 家族域（启动健康检查 / 家族清单 / 选中 / 两段式删除）──────
