@@ -16,6 +16,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "app"))
 
 import services.context_store as cs  # noqa: E402
+from services import forge_spec_guard as guard      # noqa: E402
 
 cs.SQLITE_PATH = Path(tempfile.mkdtemp(prefix="forge_")) / "f.db"
 
@@ -401,4 +402,48 @@ check("清空 override 后恢复自动渲染",
       _render_via_family("t16f", fam2, {}, {})["prompt"] != "手改提示词全文，生成时应原样返回而不渲染三段式。")
 
 print()
+
+# ══════════════════════════════════════════════════════════
+# 模型输出形状容错（2026-10-07 端到端实测抓到的真缺陷）
+# ══════════════════════════════════════════════════════════
+# ★ 事故：工坊提炼跑到「编译家族模板」阶段（已花 170 秒、几十次调用）时，
+#   forge_spec_guard._normalize 里`params.items()` 抛
+#   AttributeError: 'list' object has no attribute 'items' ——
+#   模型把 params 返回成了**列表**。整条流水线归零，用户只看到"提炼失败"。
+#   模型输出形状有偏差是常态，这条断言就是不许它再变成事故。
+print("\n[测试 6] params 形状容错（list / 非 dict / 缺失）")
+_base = {"id": "x", "name": "测试家族", "segments": {"主体": "{{subject.name}}"},
+         "hard_forbid": [], "suitable": [], "allow_change": []}
+
+for label, params, expect_min in [
+    ("正常 dict", {"笔触": {"type": "select", "options": ["a", "b"]}}, 1),
+    ("★ 列表（事故现场）",
+     [{"name": "笔触", "type": "select", "options": ["a", "b"]},
+      {"name": "配色", "type": "select", "options": ["暖", "冷"]}], 2),
+    # ★ 事故现场：列表项没有 name/id，只有"参数名"中文键或单键嵌套
+    ("列表项用中文「参数名」",
+     [{"参数名": "笔触", "type": "select", "options": ["a", "b"]},
+      {"参数名": "配色", "type": "select", "options": ["暖", "冷"]}], 2),
+    ("列表项是单键嵌套（{笔触:{...}}）",
+     [{"笔触": {"type": "select", "options": ["a", "b"]}},
+      {"配色": {"type": "select", "options": ["暖", "冷"]}}], 2),
+    ("列表项只有 label", [{"label": "笔触", "type": "select"}], 1),
+    ("列表但元素不是 dict", ["不是字典", 123], 0),
+    ("params 是字符串（离谱形状）", "我给忘了", 0),
+]:
+    try:
+        out = guard._normalize({**_base, "params": params})
+        got = len(out.get("params") or {})
+        check(f"{label} → 不抛异常且归一为 dict（{got} 项）",
+              isinstance(out.get("params"), dict), str(type(out.get("params"))))
+        check(f"{label} → 保留 {expect_min} 项参数",
+              got >= expect_min, f"实际 {got}")
+    except Exception as e:                                       # noqa: BLE001
+        check(f"{label} → 不抛异常且归一为 dict", False,
+              f"抛了 {type(e).__name__}: {e}")
+
+check("缺 params 键也不炸（按空处理）",
+      isinstance(guard._normalize(dict(_base)).get("params"), dict))
+print()
 print(f"结果：{PASS} 通过 / {FAIL} 失败")
+sys.exit(1 if FAIL else 0)

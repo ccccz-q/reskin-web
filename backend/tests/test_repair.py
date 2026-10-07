@@ -135,14 +135,31 @@ def fake_fail(**kw):
     return {"success": False, "error": "上游超时"}
 
 
+import governance.guard as _guard                            # noqa: E402
+
 reg.generate_image_with_reference = fake_fail
-reg.release_generation = lambda thread_id, token, reason="": released.append(reason) or {"ok": 1}
+_orig_release = _guard.release_generation
+# ★ 2026-10-06：改 patch `governance.guard.release_generation`，不是 `reg.` 那个名字。
+#   原因：归还逻辑已从「调用点各写一次 release_generation」收敛成
+#   `guard.generation_guard` 的幂等 finally（见 governance/guard.py）。
+#   patch 模块属性在调用时才查，所以这里能拦住；
+#   而 patch `reg.release_generation` 现在拦不到任何东西 ——
+#   测试会"通过"或"失败"于一个和被测行为无关的原因。
+#   断言也从「哪个函数被调用」改成行为：**恰好退过一次，且工具把 quota 回给模型**。
+_guard.release_generation = lambda thread_id, token, reason="": (
+    released.append(reason) or {"ok": 1})
 # 测试 3 结束时 artifacts 指向假路径 /tmp/new_image.jpg（磁盘上不存在），
-# 会被前置条件拦下 —— 指回真实存在的临时文件，才能走到生成与退额路径
+# 会被前置条件拦下—— 指回真实存在的临时文件，才能走到生成与退额路径
 ctx.artifacts["image_path"] = last_generated
 r = tool_repair_image({"change": "再修一次"}, ctx)
 check("失败返回 error", not r.get("success"), str(r)[:100])
-check("★ 失败时额度已退还", len(released) == 1, str(released))
+check("★ 失败时额度已退还（恰好一次，不多不少）",
+      len(released) == 1, str(released))
+check("★ 退还结果回传给模型（它要靠这个告诉用户退了多少）",
+      isinstance(r.get("quota"), dict), str(r.get("quota")))
+check("★ 退还原因是真实错误而不是空串",
+      bool(released and released[0]), str(released))
+_guard.release_generation = _orig_release
 
 # ── 测试 5：注册完整性 ──────────────────────────────────
 print("\n[测试 5] 四处注册齐全")

@@ -3,7 +3,10 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- viewport-fit=cover：让页面延伸到刘海/圆角区域，
+         再由 CSS 的 env(safe-area-inset-*) 把内容让回来。
+         不写这一句，safe-area 全是 0，iPhone 上底部按钮会被手势条压住。 -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="description" content="换颜 Reskin · 上传一张旅行照片，选一套风格家族：照片不动，只换一种视觉身份。" />
     <meta name="theme-color" content="#efe4d4" />
     <title>换颜 Reskin · 原图保真 · 创意叠加</title>

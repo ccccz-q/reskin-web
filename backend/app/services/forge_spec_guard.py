@@ -75,7 +75,54 @@ def _normalize(doc: Any) -> dict:
         if key in out and not isinstance(out[key], (dict, list)):
             out.pop(key)
 
-    params = out.get("params") or {}
+    # ★★ params 的形状必须容错（2026-10-07 端到端实测抓到的真缺陷）
+    #   实测：工坊提炼跑到「编译家族模板」（已花 170s、几十次调用）时崩在这里 ——
+    #     AttributeError: 'list' object has no attribute 'items'
+    #   原因是模型把 params 返回成了**列表**（[{name:.., type:..}, ...]）而不是字典。
+    #   模型输出形状有偏差是**常态**，不是异常情况；让它把整条 3 分钟的流水线
+    #   连同前面所有调用一起废掉，是最坏的处理方式 —— 用户看到的是"提炼失败"，
+    #   根因却是一个下标/属性错误，跟"风格提炼失败"毫无关系。
+    #   现在：三种形状都归一到 dict，list 按 name/id/参数名 提取；
+    #   实在认不出来就返回空 dict（下游 preflight 会明确报"没有参数"，
+    #   那才是**用户能看懂、能行动**的失败）。
+    params = out.get("params")
+    if isinstance(params, list):
+        _raw_len = len(params)
+        converted: dict = {}
+        for item in params:
+            if not isinstance(item, dict):
+                continue
+            # ★ 键名要认得足够多（实测踩坑）：第一版只认 name/id/key，
+            #   结果模型给的 3 个参数**一个都没认出来**，归一成空 dict；
+            #   后面家族模板引用 {figure_count_desc} 就找不到对应参数，
+            #   QC 判定"占位符会渲染成空串"→ 整份草稿被拒。
+            #   换个键名模型照样能通过 —— 认得越多，误判越少。
+            key = (item.get("name") or item.get("id") or item.get("key")
+                   or item.get("param") or item.get("slug")
+                   or item.get("参数名") or item.get("名称")
+                   or item.get("label") or item.get("title"))
+            if not key:
+                # 形状二：[{"笔触": {"type": "select", ...}}, ...]
+                # 取唯一那个"看起来像参数名"的键（值是 dict）。
+                # ★ 注意：不能写成 `[k for k, v in item.items() ...]`
+                #   然后在推导外用 v —— 推导里的变量不泄漏出去，
+                #   那样写会得到 NameError（写这行时真的踩了一次）。
+                nested = [(k, v) for k, v in item.items()
+                          if isinstance(v, (dict, list))]
+                if len(nested) == 1:
+                    key, val = nested[0]
+                    item = {**(val if isinstance(val, dict) else {}), "name": key}
+            if key:
+                converted[str(key)] = item
+        params = converted
+        logger.warning("模型把 params 返回成了列表（%d 项 → 认出 %d 项），已归一成字典",
+                       _raw_len, len(converted))
+    elif not isinstance(params, dict):
+        if params is not None:
+            logger.warning("params 的形状不是 dict也不是 list（%s），按空处理",
+                           type(params).__name__)
+        params = {}
+    params = params or {}
     # ★ segments 双花括号归一（实测 2026-10-01）：模型会在 YAML 语境"多写一层括号"
     #   （{{subject.name}}），渲染器宽容后仍统一转成单括号，保持入库产物干净。
     segs_out = out.get("segments")

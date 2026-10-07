@@ -1423,7 +1423,11 @@ button.placard-chip:disabled { opacity: .5; cursor: not-allowed; }
   background: var(--paper-2);
   border: 2px solid var(--line);
   box-shadow: 8px 8px 0 rgba(22, 36, 43, .35);
+  /* ★ 两行写法：先 100vh 给不支持 dvh 的浏览器兜底，再让 100dvh 覆盖。
+     移动端地址栏会随滚动收放，100vh 取的是"地址栏收起时"的最大视口，
+     面板高度按它算会在滚动到一半时多出一条空白；dvh 跟的是真实可视高度。 */
   max-height: calc(100vh - 44px);
+  max-height: calc(100dvh - 44px);
 }
 .repair-head {
   display: flex; align-items: center; gap: 12px;
@@ -1789,3 +1793,188 @@ button.placard-chip:disabled { opacity: .5; cursor: not-allowed; }
 }
 .fam-ex-hide:hover { background: var(--ink); color: var(--paper); transform: translateY(-1px); }
 .fam-ex-hide:active { transform: translateY(0); }
+
+/* ══════════════ 错误边界兜底页 ══════════════
+   沿用纸质剪贴簿的视觉语言（硬边框 + 硬阴影 + 等宽字标签），
+   刻意做得像"一张出了状况的纸"—— 白底黑框的通用错误页
+   在这个界面里会显得像系统报错，而不是产品的一部分。 */
+.eb-page {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  padding-left: max(24px, env(safe-area-inset-left));
+  padding-right: max(24px, env(safe-area-inset-right));
+}
+.eb-card {
+  width: min(560px, 100%);
+  padding: 26px 24px 22px;
+  background: var(--paper-2);
+  border: 2px solid var(--line);
+  box-shadow: 8px 8px 0 rgba(22, 36, 43, .35);
+}
+.eb-glyph {
+  font-size: 30px;
+  line-height: 1;
+  color: var(--red-deep);
+}
+.eb-title {
+  font-size: 24px;
+  font-weight: 800;
+  letter-spacing: 2px;
+  margin: 10px 0 8px;
+}
+.eb-lead {
+  font-size: 13px;
+  line-height: 1.75;
+  color: var(--ink-soft);
+  text-wrap: pretty;
+}
+.eb-actions { display: flex; gap: 10px; flex-wrap: wrap; margin: 18px 0 4px; }
+.eb-detail { margin-top: 16px; }
+.eb-detail summary {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: .06em;
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+.eb-pre {
+  margin-top: 8px;
+  padding: 10px;
+  max-height: 32vh;
+  overflow: auto;
+  background: var(--paper);
+  border: 1.5px dashed var(--ink-soft);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.6;
+  /* 堆栈没有自然换行点，窄屏会横向溢出把卡片撑破 */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* ══════════════ 移动端适配 ══════════════
+   ★ 现场演示基本都在手机上做，这一段不是"顺手兼容"而是主战场。
+   两件事必须同时做，缺一个就等于没做：
+     ① 安全区（刘海 / 灵动岛 / 底部小黑条）—— 否则底部 dock 和
+        弹窗的按钮会被系统手势条压住，看着像"点不到"。
+     ② 触控目标≥44px —— 手指的命中面积比鼠标小得多，
+        28~34px 的按钮在桌面能用、在手机上会频繁误触旁边那个。 */
+
+/* 安全区变量的兜底：老浏览器不认 env()，整条声明会被丢弃，
+   所以先给0 再用 max() 覆盖 —— 不能让"不支持"等于"布局崩掉"。
+   --sab/--sat/--sal/--sar: safe-area bottom/top/left/right */
+:root {
+  --sal: env(safe-area-inset-left, 0px);
+  --sar: env(safe-area-inset-right, 0px);
+  --sat: env(safe-area-inset-top, 0px);
+  --sab: env(safe-area-inset-bottom, 0px);
+}
+
+/* 页面骨架：四边让开安全区。左右用 max() 而不是直接相加 ——
+   刘海屏横屏时左右有 inset，竖屏时为 0，两种都得对。 */
+.app {
+  padding-left: max(14px, var(--sal));
+  padding-right: max(18px, var(--sar));
+  padding-top: calc(14px + var(--sat));
+  padding-bottom: calc(12px + var(--sab));
+}
+
+/* 顶栏：状态徽标那行在有刘海时被压住最明显 */
+.topbar { padding-top: 2px; }
+
+/* toast 固定在右上角 —— 右侧与顶部都要避开安全区，
+   否则在刘海屏上它会正好贴在圆角/灵动岛下面。 */
+.toast-wrap {
+  top: calc(16px + var(--sat));
+  right: calc(18px + var(--sar));
+}
+
+/* 全屏浮层：内容居中，但上下左右都要在安全区内，
+   否则底部按钮落在手势条上、顶部标题被刘海切掉。
+   ★ 底部对话抽屉（.dock）不在此列：它是 .app 的最后一个子元素，
+     而 .app 的 padding-bottom 已经含了 --sab，再垫一次会双倍留白。 */
+.ws-mask,
+.set-mask,
+.gal-mask,
+.repair-mask,
+.forge-notice-mask,
+.lightbox {
+  padding-top: calc(22px + var(--sat));
+  padding-bottom: calc(22px + var(--sab));
+  padding-left: calc(22px + var(--sal));
+  padding-right: calc(22px + var(--sar));
+}
+/* 灯箱原本就是 24px 内边距，单独对齐一下，别被上面覆盖成 22px */
+.lightbox {
+  padding-top: calc(24px + var(--sat));
+  padding-bottom: calc(24px + var(--sab));
+}
+/* 关闭钮在右上角，单独吃一次右上安全区（父级 padding 管不到绝对定位） */
+.lightbox-close {
+  top: calc(18px + var(--sat));
+  right: calc(22px + var(--sar));
+}
+
+/* ───────── 手机断点：顶栏按钮与操作条 ───────── */
+@media (max-width: 760px) {
+  /* 顶栏 4 个按钮各min-width:92px，合计 ≥368px 再加 gap，
+     360px 宽的手机上必然挤爆（换行或横向溢出）。
+     改成 2×2 网格铺满整行：每格 ≥ 半个屏宽，按钮本体撑满。 */
+  .topbar { align-items: flex-start; gap: 10px; }
+  .topbar-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    width: 100%;
+  }
+  .topbar-actions .ws-open {
+    min-width: 0;            /* 解掉桌面版的 92px 下限，让网格说了算 */
+    width: 100%;
+    min-height: 44px;
+  }
+  .brand-mark { font-size: 24px; }
+  .badges { font-size: 10.5px; }
+
+  /* 操作条：生成按钮独占一行，提示文字另起一行。
+     横排放不下时 flex-wrap 会把按钮挤成半行、字被压断。 */
+  .actionbar { gap: 10px; padding: 10px; }
+  .btn-generate {
+    width: 100%;
+    min-width: 0;
+    min-height: 52px;
+    font-size: 16px;
+  }
+  .actions-hint { flex: 1 1 100%; font-size: 11.5px; }
+
+  /* 触控目标：桌面 28~34px 在手机上命中率不够，统一提到 44px。
+     只在这个断点里改，桌面版式保持原样。
+     .btn / .composer input 已覆盖工具栏、dock 发送钮、拖拽区按钮 ——
+     它们都挂在这两个 class 上，不必逐个列。 */
+  .btn,
+  .composer input,
+  .extra-mode,
+  .ws-tab, .ws-close,
+  .fam-ex-hide,
+  .tb-btn,
+  .result-tip-go,
+  .placard-chip.btn-chip,
+  .recent-thumb,
+  .drift-item,
+  .fam {
+    min-height: 44px;
+  }
+
+  /* 移动端浏览器的地址栏会随滚动收放，100vh 指的是"最大视口"，
+     用它算高度会在滚动到一半时留出一条空白。优先 100dvh。 */
+  .stage { min-height: clamp(200px, 42vh, 420px); }
+  .stage-img { max-height: min(42vh, 420px); }
+  .ws { max-height: 92vh; max-height: 92dvh; }
+  .set { max-height: 92vh; max-height: 92dvh; }
+  .gal { max-height: 92vh; max-height: 92dvh; }
+  .repair { max-height: calc(100vh - 44px); max-height: calc(100dvh - 44px); }
+  .dock-body { height: min(52vh, 380px); }
+}

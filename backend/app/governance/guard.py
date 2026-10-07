@@ -23,6 +23,7 @@ import os
 import sys
 import threading
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -265,6 +266,83 @@ def check_upload_size(nbytes: int) -> None:
             f"上传文件 {mb:.1f}MB 超过上限 {limit:.0f}MB，请压缩后再试",
             code="upload_too_large",
         )
+
+
+class _GenerationGuard:
+    """`generation_guard` 的产物：显式提交，否则自动退还"""
+
+    __slots__ = ("thread_id", "token", "reference_image", "settled", "quota")
+
+    def __init__(self, thread_id: str, token: str, reference_image: str | None):
+        self.thread_id = thread_id
+        self.token = token
+        self.reference_image = reference_image or ""
+        self.settled = False
+        self.quota: dict | None = None
+
+    def commit(self, *, size: str = "") -> dict:
+        """出图成功 —— 预扣正式生效。**只能调一次**，重复调用直接抛。"""
+        if self.settled:
+            raise RuntimeError("generation_guard.commit() 只能调用一次")
+        self.settled = True
+        self.quota = settle_generation(self.thread_id, self.token, size=size,
+                                      reference=self.reference_image)
+        return self.quota
+
+    def release(self, *, reason: str = "") -> dict | None:
+        """退还（**幂等**）：已commit 过就是 no-op，所以可以放在 finally 里无条件调"""
+        if self.settled:
+            return None
+        self.settled = True
+        return release_generation(self.thread_id, self.token, reason=reason)
+
+
+def new_generation_guard(thread_id: str, token: str, *,
+                         reference_image: str | None = None) -> _GenerationGuard:
+    """给「已经自己 reserve 过了」的调用点用
+
+    为什么需要这个：HTTP 层的 reserve 要把 `GovernanceError` 翻译成
+    429/403（前端要区分"额度用完"和"被禁用"），所以那一步必须显式写。
+    但**归还**不该跟着写成 except 分支 —— 那正是漏退的来源。
+    于是拆成两半：reserve 显式（为了映射错误码），归还交给 guard（幂等）。
+    """
+    return _GenerationGuard(thread_id, token, reference_image)
+
+
+@contextmanager
+def generation_guard(thread_id: str, *, reference_image: str | None = None):
+    """**出图额度护栏**：预扣 → 成功 commit / 任何其它结局自动退还
+
+    ★ 为什么要有这个（2026-10-06 评审自查发现的真实漏洞）：
+      原来的写法是每个调用点自己「预扣 → try 出图 → except 特定异常才 release」。
+      问题在于「except 只捕了某一种异常」：image.py 只捕 `ConfigMissing`，
+      而 `generate_image_with_reference` 内部还会 `raise ValueError`
+      （尺寸非法、上游返回体缺字段等）。这类异常穿过 except 直达 FastAPI，
+      **票据就悬在那里** —— 用户没拿到图，额度却被扣着，只能等 TTL（30 分钟）
+      或下次启动对账才回收。同一类洞还有一处：任务被判超时时只 cancel 不退还。
+
+      凡是「先占用额度、再做一件可能失败的事」的地方，都应该用它：
+      它把「归还」从**调用点的一个分支**变成**语言层面的保证** ——
+      异常、提前 return、甚至 `raise HTTPException` 都自动退还，
+      新增异常类型时不需要记得补 except。
+
+    用法：
+        with generation_guard(tid, reference_image=path) as g:
+            result = do_expensive_thing()
+            if not result.get("success"):
+                raise SomeError(result["error"])      # 自动退还
+            g.commit(size=result.get("size", ""))    # 只有成功才核销
+    """
+    token = reserve_generation(thread_id, reference_image=reference_image)
+    guard = _GenerationGuard(thread_id, token, reference_image)
+    try:
+        yield guard
+    except BaseException as e:                       # noqa: BLE001
+        guard.release(reason=f"异常退出：{type(e).__name__}")
+        raise
+    if not guard.settled:
+        # 没 commit 就走完了流程（= 没拿到图）→ 退还
+        guard.release(reason="未提交即退出")
 
 
 def settle_generation(thread_id: str, token: str, *, size: str, reference: str = "") -> dict:

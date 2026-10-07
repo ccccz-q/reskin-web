@@ -66,6 +66,25 @@ export function thumbSrc(url, w = 320) {
   return `${BASE}/api/image/thumb?u=${encodeURIComponent(url)}&w=${w}`
 }
 
+/**
+ * FormData / blob 端点的统一错误解析。
+ * ★ 为什么要抽出来：这段「取 detail.message → 回落兜底文案 → 抛错」曾逐字
+ *   重复4 次（upload / repair / diagnose / 打包下载）。复制粘贴的代价是
+ *   改一次文案要改4 处，漏一处就出现「同一个错误两种说法」。
+ *   注意后端 detail 可能是字符串也可能是 {message}，两种都得认。
+ */
+async function throwResponseError(resp, fallback) {
+  let msg = fallback
+  try {
+    const b = await resp.json()
+    const d = b?.detail
+    const picked = d?.message || d || b?.error
+    if (typeof picked === 'string' && picked) msg = picked
+    else if (picked != null) msg = JSON.stringify(picked)
+  } catch { /* 非 JSON 响应（网关错误页）保留兜底文案 */ }
+  throw new Error(msg)
+}
+
 async function request(path, options = {}) {
   // 先把 headers 解构出来再展开剩余项 —— 旧写法是
   //   { headers: A, ...options, ...(options.headers ? { headers: B } : {}) }
@@ -121,11 +140,7 @@ export const api = {
       headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ urls }),
     })
-    if (!resp.ok) {
-      let msg = '打包下载没有成功，请稍后再试'
-      try { const b = await resp.json(); msg = b?.detail?.message || b?.detail || msg } catch { /* 保留兜底 */ }
-      throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg))
-    }
+    if (!resp.ok) await throwResponseError(resp, '打包下载没有成功，请稍后再试')
     return resp   // 调用方拿 blob
   },
 
@@ -211,14 +226,7 @@ export const api = {
       headers: authHeaders(),   // 不设 Content-Type：让浏览器自己带 multipart 边界
       body: form,
     })
-    if (!resp.ok) {
-      let msg = '图片上传没有成功，请稍后再试'
-      try {
-        const b = await resp.json()
-        msg = b?.detail?.message || b?.detail || msg
-      } catch { /* ignore */ }
-      throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg))
-    }
+    if (!resp.ok) await throwResponseError(resp, '图片上传没有成功，请稍后再试')
     return resp.json()
   },
 
@@ -238,14 +246,7 @@ export const api = {
       headers: authHeaders(),
       body: form,
     })
-    if (!resp.ok) {
-      let msg = '修复没有成功，请稍后再试'
-      try {
-        const b = await resp.json()
-        msg = b?.detail?.message || b?.detail || msg
-      } catch { /* ignore */ }
-      throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg))
-    }
+    if (!resp.ok) await throwResponseError(resp, '修复没有成功，请稍后再试')
     return resp.json()
   },
 
@@ -261,14 +262,7 @@ export const api = {
       headers: authHeaders(),
       body: form,
     })
-    if (!resp.ok) {
-      let msg = 'AI 找问题没有成功，请稍后再试'
-      try {
-        const b = await resp.json()
-        msg = b?.detail?.message || b?.detail || msg
-      } catch { /* ignore */ }
-      throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg))
-    }
+    if (!resp.ok) await throwResponseError(resp, 'AI 找问题没有成功，请稍后再试')
     return resp.json()
   },
 
@@ -298,69 +292,6 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ code }),
     }),
-}
-
-/**
- * SSE 对话 —— 把 Tool-use Loop 的每一步实时推出来
- *
- * 为什么不用 fetch + 手动解析：EventSource 只支持 GET。
- * 这里坚持 POST（消息体里要带 card / 参数），所以手读 ReadableStream。
- */
-export async function streamChat({
-  message, threadId, imageUrl, card, allowSpend, onEvent, signal,
-  extraPrompt = '', extraMode = 'append',
-}) {
-  const resp = await fetch(apiPath('/api/chat/stream'), {
-    method: 'POST',
-    headers: authHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify({
-      message,
-      thread_id: threadId,
-      image_url: imageUrl || '',
-      card: card || {},
-      allow_spend: allowSpend,
-      // 用户自定义提示词：请求级字段，原样进最终 prompt
-      extra_prompt: extraPrompt,
-      extra_mode: extraMode,
-    }),
-    signal,
-  })
-  if (!resp.ok) {
-    // SSE 端点的错误体是 {detail: {code, message}}，把 message 提出来 ——
-    // 否则限流时用户只看到干巴巴的状态码（复审 D-5）
-    let msg = '对话暂时没有连上，请稍等片刻再试'
-    try {
-      const body = await resp.json()
-      msg = body?.detail?.message || body?.detail || body?.error || msg
-    } catch { /* 非 JSON 就保留兜底 */ }
-    throw new Error(typeof msg === 'string' ? msg : JSON.stringify(msg))
-  }
-
-  const reader = resp.body.getReader()
-  const decoder = new TextDecoder('utf-8')
-  let buffer = ''
-  let finalPayload = null      // ← done 事件里的真实结果
-
-  while (true) {
-    const { value, done } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-
-    const frames = buffer.split('\n\n')
-    buffer = frames.pop() || ''
-    for (const frame of frames) {
-      const evLine = frame.split('\n').find((l) => l.startsWith('event: '))
-      const dataLine = frame.split('\n').find((l) => l.startsWith('data: '))
-      if (!evLine || !dataLine) continue
-      const event = evLine.slice(7).trim()
-      let data = {}
-      try { data = JSON.parse(dataLine.slice(6)) } catch { /* 忽略脏帧 */ }
-      if (event === 'done') finalPayload = data
-      if (event === 'close') return finalPayload ?? data
-      onEvent?.(event, data)
-    }
-  }
-  return finalPayload ?? {}
 }
 
 /* ══════════════ 异步对话（后台任务 + 轮询）══════════════

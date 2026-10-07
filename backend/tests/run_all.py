@@ -32,6 +32,8 @@ FILES = [
     "test_repair_http.py", # repair/diagnose HTTP 层：会话隔离 + 落盘结构 + 限速
     "test_helper_doc.py",  # 小助手知识索引：新功能问得到 + 单节不被截断
     "test_governance.py",
+    "test_config_boot.py",   # 启动期：安全闸门必须永远能跑完（曾 NameError 崩进程）
+    "test_concurrency.py",   # 线程并发：不许超卖 / DB 损坏 / 网络层异常（曾漏判为确定性失败）
     "test_context_store.py",
     "test_agent_loop.py",
     "test_api_smoke.py",
@@ -73,7 +75,14 @@ for name in FILES:
         ln for ln in out.splitlines()
         if ln.startswith(("  OK", "  FAIL", "   ")) or ln.startswith("结果：")
     ]
-    summary = next((ln for ln in out.splitlines() if ln.startswith("结果：")), "")
+    # ★ 取**最后**一条「结果：」，不是第一条（2026-10-07 修）
+    #   踩坑现场：给 test_forge.py 追加了一段新断言，它自己会再打一次汇总，
+    #   于是文件里有两条「结果：」。旧代码用 next() 取第一条 ——
+    #   报告停留在追加前的 81 项，而真实是 90 项。
+    #   这类"统计口径失真"比测试红更阴险：它不会让CI 变红，
+    #   只会让人在 README 里写下错误的数字（而且一直没人发现）。
+    _summaries = [ln for ln in out.splitlines() if ln.startswith("结果：")]
+    summary = _summaries[-1] if _summaries else ""
     print("\n".join(lines[-40:]) if len(lines) > 40 else "\n".join(lines))
     code = proc.returncode
     failed = summary.count("失败")

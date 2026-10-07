@@ -288,6 +288,141 @@ lt3 = cs.load_long_term(tid)
 check("异常后数据仍是上一版", lt3["summary"] == "这是一段没有 JSON 的纯文本摘要")
 
 print()
+print("=== 14. 收尾失败的话术按「手上有没有东西」分档 ===")
+# ★ 评审自查发现：repeat_fuse / step_limit 两处收尾原本都写死「（模型调用失败）…」。
+#   可这三种情形的用户处境完全不同 —— 图已落盘时用户手上就是成品，
+#   告诉他"调用失败"会让他以为白跑甚至重做（forced_final 早就修过这个坑）。
+#   所以话术必须看 ctx.artifacts 说话，不能一句模板走天下。
+
+class _Ctx:
+    def __init__(self, arts):
+        self.artifacts = arts
+
+
+_reply_img = loop._final_fallback_reply(_Ctx({"image_path": "/x/y.png"}))
+check("有图：明确告诉用户图已生成好", "图已经生成好了" in _reply_img, repr(_reply_img[:28]))
+check("有图：不再出现「模型调用失败」字样", "模型调用失败" not in _reply_img)
+
+_reply_prompt = loop._final_fallback_reply(_Ctx({"last_prompt": "a prompt"}))
+check("只有提示词：给出可执行的下一步", "继续" in _reply_prompt, repr(_reply_prompt[:28]))
+
+_reply_none = loop._final_fallback_reply(_Ctx({}))
+check("什么都没有：给具体化建议", "具体一点" in _reply_none, repr(_reply_none[:28]))
+check("三档话术互不相同",
+      len({_reply_img, _reply_prompt, _reply_none}) == 3)
+check("没有产物时也不会出现「模型调用失败」", "模型调用失败" not in _reply_none)
+check("artifacts 缺失（None）也不炸",
+      bool(loop._final_fallback_reply(_Ctx(None))))
+
+print()
+print("=== 15. step_limit 到达时 tool 协议必然完整（防御性补齐的正当性依据）===")
+# 这条断言的作用不是"证明曾经有 bug"，而是**钉住这个前提**：
+# 若将来有人在工具循环里加了新的 break 路径，这条会先红，
+# 提醒他补_fill_missing_tool_replies（或者确认新路径也需要补）。
+_seen = {"messages": None}
+
+
+def _capture_summary(messages):
+    _seen["messages"] = [dict(m) for m in messages]
+    return {"content": "收尾结论", "tool_calls": [], "usage": {},
+            "finish_reason": "stop"}
+
+
+_prev_summary = loop.summarize_for_final
+loop.summarize_for_final = _capture_summary
+try:
+    class FakeMulti:
+        def __init__(self):
+            self.i = 0
+
+        def __call__(self, messages, tools=None, tool_choice="auto", temperature=0.2):
+            self.i += 1
+            return {"content": "", "finish_reason": "tool_calls",
+                    "usage": {"total_tokens": 5},
+                    "tool_calls": [
+                        {"id": f"m{self.i}a", "name": "list_families",
+                         "arguments": {"tag": str(self.i)}},
+                        {"id": f"m{self.i}b", "name": "describe_family",
+                         "arguments": {"family_id": "zine"}},
+                    ]}
+
+    loop.chat_with_tools = FakeMulti()
+    _prev_steps = loop.MAX_AGENT_STEPS
+    loop.MAX_AGENT_STEPS = 2
+    r15 = loop.run("协议完整性探针", thread_id="t15", image_path=img,
+                   image_info=info)
+    loop.MAX_AGENT_STEPS = _prev_steps
+    check("确实走到 step_limit", r15.stopped_reason == "step_limit",
+          r15.stopped_reason)
+
+    _declared, _answered = [], set()
+    for _m in _seen["messages"] or []:
+        for _tc in (_m.get("tool_calls") or []):
+            _declared.append(_tc["id"])
+        if _m.get("role") == "tool":
+            _answered.add(_m.get("tool_call_id"))
+    check("每个 tool_call 都有对应回复（协议完整）",
+          all(i in _answered for i in _declared),
+          f"声明 {len(_declared)} / 回复 {len(_answered)}")
+    check("确实存在多个 tool_call（这条断言才有意义）",
+          len(_declared) >= 2, str(len(_declared)))
+finally:
+    loop.summarize_for_final = _prev_summary
+
+print()
+print("=== 16. 上下文 token 预算：按条数裁剪不等于安全 ===")
+#★ 评审自查发现：HISTORY_LIMIT 只管「条数」，20 条长消息的 token 量
+#   可能顶得上 200 条短消息 —— 条数达标但 token 爆掉，上游直接拒绝整轮。
+check("估算器：中文按 1 字 1 token（保守）",
+      loop._est_tokens("汉" * 100) >= 100, str(loop._est_tokens("汉" * 100)))
+check("估算器：ASCII 按 4 字符 1 token",
+      loop._est_tokens("a" * 400) <= 110, str(loop._est_tokens("a" * 400)))
+check("估算器：空串不算token", loop._est_tokens("") == 0)
+check("估算器：单字符不会被估成 0（+1 保底）",
+      loop._est_tokens("x") >= 1, str(loop._est_tokens("x")))
+
+# 造一条超预算的长历史，验证真的被裁掉，且至少留最后一条
+tid_budget = "t_budget"
+for i in range(12):
+    cs.append_message(tid_budget, "user", f"第{i}轮提问 " + "内容" * 400)
+_saved_budget = config.CONTEXT_TOKEN_BUDGET
+try:
+    config.CONTEXT_TOKEN_BUDGET = 500          # 故意给得很小
+    trimmed = loop._history_within_budget(tid_budget, 20)
+    check("超预算时真的裁剪了（条数变少）", len(trimmed) < 12,
+          f"{len(trimmed)}/ 12")
+    check("★ 至少保留一条（不能裁成空对话）", len(trimmed) >= 1,
+          str(len(trimmed)))
+    check("★ 保留的是**最新**的那些（丢最旧）",
+          bool(trimmed) and "第11轮" in str(trimmed[-1]),
+          str(trimmed[-1])[:60] if trimmed else "")
+    # 预算放大到极大时不该裁
+    config.CONTEXT_TOKEN_BUDGET = 10_000_000
+    full = loop._history_within_budget(tid_budget, 20)
+    check("预算充足时一条都不裁", len(full) == 12, f"{len(full)}/ 12")
+    # 预算<=0 时退化为「只按条数」（关掉这道闸）
+    config.CONTEXT_TOKEN_BUDGET = 0
+    off = loop._history_within_budget(tid_budget, 5)
+    check("预算设为 0 = 关闭这道闸（退回纯条数限制）",
+          len(off) == 5, str(len(off)))
+finally:
+    config.CONTEXT_TOKEN_BUDGET = _saved_budget
+
+print()
+print("=== 17. 护栏常量口径统一（都能从 config 走）===")
+check("HISTORY_LIMIT 来自 config", loop.HISTORY_LIMIT == config.HISTORY_LIMIT,
+      f"{loop.HISTORY_LIMIT} vs {config.HISTORY_LIMIT}")
+check("REPEAT_FUSE 来自 config", loop.REPEAT_FUSE == config.REPEAT_FUSE,
+      f"{loop.REPEAT_FUSE} vs {config.REPEAT_FUSE}")
+check("MEMORY_TRIGGER 来自 config",
+      loop.MEMORY_TRIGGER == config.MEMORY_TRIGGER,
+      f"{loop.MEMORY_TRIGGER} vs {config.MEMORY_TRIGGER}")
+_src = (_root / "engine" / "loop.py").read_text(encoding="utf-8")
+check("loop.py 里不再硬编码这三个数字",
+      "HISTORY_LIMIT = 20" not in _src and "REPEAT_FUSE = 2" not in _src
+      and "MEMORY_TRIGGER = 12" not in _src)
+
+print()
 print(f"结果：{PASS} 通过 / {FAIL} 失败")
 
 # ★ 必须用退出码报告失败 —— 只 print 不 exit 的话，

@@ -10,6 +10,31 @@ import './App.css'
 
 const THREAD = 'studio'
 
+// ── 上传前预校验（与后端 config.py 同一口径）─────────────
+// 为什么要前端先拦：20MB 上限原本只写在拖拽区那行提示文案里，
+// 用户要等整张图传完、服务端回413 才知道自己超了 —— 白等一趟。
+// 三个上传入口（拖拽 / 点选 / 粘贴）都走这一个函数，
+// 免得哪天加第四个入口就漏掉了校验。
+const MAX_UPLOAD_BYTES = 20 * 1024 * 1024          // = backend MAX_UPLOAD_BYTES
+const ACCEPTED_EXT = /\.(jpe?g|png|webp)$/i        // = backend ALLOWED_IMAGE_FORMATS（JPEG/PNG/WEBP）
+// 部分环境（截图工具、Word 粘贴）不给扩展名，只给 MIME —— 所以两条路都要认
+const ACCEPTED_MIME = /^image\/(jpeg|png|webp)$/
+
+/** 返回错误文案；null 表示这份文件可以发。 */
+function validateUploadFile(file) {
+  if (!file) return null
+  const name = file.name || '这个文件'
+  // 先看类型再看大小：把「选错文件」报成「文件太大」会把人引到错误方向
+  if (!(ACCEPTED_MIME.test(file.type) || ACCEPTED_EXT.test(name))) {
+    return `「${name}」不是图片 —— 请上传 JPG / PNG / WebP 格式的照片`
+  }
+  if (file.size > MAX_UPLOAD_BYTES) {
+    // 用 MB 而不是字节数：用户看到「20971520」没有任何判断力
+    return `「${name}」有 ${(file.size / 1024 / 1024).toFixed(1)}MB，超过 20MB 上限 —— 请先压缩或换一张`
+  }
+  return null
+}
+
 export default function App() {
   const [booting, setBooting] = useState(true)
   const [health, setHealth] = useState(null)
@@ -88,12 +113,12 @@ export default function App() {
   const [busy, setBusy] = useState(false)
   const [toast, setToast] = useState('')
 
-  const abortRef = useRef(null)
   const taskRef = useRef(null)    // 当前后台对话任务的 task_id（用于中止）
   const renderTimer = useRef(null)
   const dropRef = useRef(null)
   const fileRef = useRef(null)
   const aliveRef = useRef(true)
+  const toastTimer = useRef(null)   // toast 自动消失的定时器（卸载时要清）
   // ★ done 丢失对账（实测场景：出图 3-5 分钟的长 SSE 连接偶发被中途掐断——
   //   代理/网络抖动都会干这个。此时后端 worker 照样跑完、图已落盘，
   //   但前端收不到 done 事件 → 画布永远不出图，只有 Agent 轨迹里那句「出图 ✓」。
@@ -183,20 +208,27 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [repairOpen, repairBusy])
 
-  // 卸载时：标记不再 setState。
+  // 卸载时：标记不再 setState，并清掉待执行的定时器。
   // ★ 后台任务**不随组件卸载而取消** —— 它跑在服务端，用户刷新或换页回来还能接着看；
   //   这是异步化相对 SSE 的一个额外好处（SSE 一断连，worker 就被通知收尾了）。
   useEffect(() => {
     aliveRef.current = true
     return () => {
       aliveRef.current = false
+      // 定时器不取消就会在组件消失后触发 setState：轻则警告，
+      // 重则把已经卸载的 toast / 确认态又改回去（用户看到「凭空又弹一次」）
+      clearTimeout(toastTimer.current)
+      clearTimeout(delArmTimer.current)
     }
   }, [])
 
   const flash = useCallback((msg) => {
     if (!aliveRef.current) return
     setToast(msg)
-    setTimeout(() => setToast((cur) => (cur === msg ? '' : cur)), 3200)
+    // 存 timer id：新提示会覆盖旧提示的关闭时机，
+    // 否则连点三处错误，三秒后被第一个 timer 提前清掉后两条还在
+    clearTimeout(toastTimer.current)
+    toastTimer.current = setTimeout(() => setToast((cur) => (cur === msg ? '' : cur)), 3200)
   }, [])
 
   // 家族清单单独抽出来：模板工坊「安装」之后要立刻刷新列表，
@@ -292,9 +324,18 @@ export default function App() {
     })
   }, [])
 
-  // ── 上传（拖拽 / 点选）
+  // ── 上传（拖拽 / 点选 / 粘贴三个入口都汇到这里）
+  // 先本地预校验再发请求：不合格的文件连网络都不碰，
+  // 也不占用上传进度与连接数（拖 20MB 照片是几十秒的事，不该白等）。
   const doUpload = useCallback(async (file) => {
     if (!file) return
+    const bad = validateUploadFile(file)
+    if (bad) {
+      flash(bad)
+      // 清空 input：否则用户修完再选同一个文件，change 不会触发（value 没变）
+      if (fileRef.current) fileRef.current.value = ''
+      return
+    }
     try {
       const saved = await api.upload(file)
       if (!aliveRef.current) return

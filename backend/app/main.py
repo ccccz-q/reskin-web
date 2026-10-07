@@ -27,6 +27,7 @@ from contextlib import asynccontextmanager
 from urllib.parse import unquote
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError         # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -118,8 +119,19 @@ async def lifespan(_app: FastAPI):
             logger.warning("%s 未配置 —— 相关功能不可用（详见 /api/health）", k)
 
     logger.info("监听 %s:%s；CORS 白名单：%s", BACKEND_HOST, BACKEND_PORT, CORS_ORIGINS)
-    yield
-    logger.info("后端已退出")
+    try:
+        yield
+    finally:
+        # ★ 2026-10-06：退出时把清扫线程停掉。它是 daemon，进程本来也会退出，
+        #   但留着它会让「重复起进程」（测试、uvicorn --reload）时线程越积越多。
+        #   放finally 里 —— 无论正常退出还是抛异常都收。
+        try:
+            from infra.tasks import shutdown_sweeper
+
+            shutdown_sweeper()
+        except Exception as e:                      # noqa: BLE001
+            logger.warning("停止清扫线程失败（不影响退出）：%s", e)
+        logger.info("后端已退出")
 
 
 app = FastAPI(
@@ -181,6 +193,47 @@ async def identity_probe(request: Request, call_next):
     return response
 
 
+@app.exception_handler(RequestValidationError)
+async def validation_failed(request: Request, exc: RequestValidationError):
+    """请求体校验失败 → 干净的 422，**不回显原始请求体**
+
+    ★ 为什么必须自定义（2026-10-06 端到端实测时撞到）：
+      FastAPI 的默认处理器会 `jsonable_encoder(exc.errors())`，
+      而 `errors()` 里带着 `input` —— 也就是**整个原始请求体**。
+      两个后果，一个比一个严重：
+        ① 请求体是二进制（客户端误把 multipart 打到 JSON 端点）时，
+           `jsonable_encoder` 对 bytes 用 `o.decode()` → UnicodeDecodeError
+           → 兜底处理器再抛一次，整条链变成 **500**，客户端拿到的是
+           「服务端内部错误」而不是本该给的 422。排障方向被彻底带偏。
+        ② 即使解码成功，用户上传的图片/隐私数据也会被**整段写进日志**
+           （实测日志里出现了整张 PNG 的二进制），日志体积与信息泄露两头失控。
+
+      正确做法：只回「哪个字段、哪一条约束不满足」，不回显值本身 ——
+      校验错误的价值在**定位字段**，不在回显用户数据。
+    """
+    from infra.logging import new_trace_id
+
+    detail = []
+    for err in (exc.errors() or [])[:8]:             # 最多 8 条，够定位了
+        loc = ".".join(str(p) for p in (err.get("loc") or []) if p != "body") or "(根)"
+        detail.append({"field": loc, "type": err.get("type", ""),
+                       "msg": str(err.get("msg", ""))[:120]})
+    trace_id = new_trace_id()
+    logger.warning("请求体校验失败 %s %s [trace=%s]：%s",
+                   request.method, request.url.path, trace_id,
+                   "; ".join(f"{d['field']}:{d['type']}" for d in detail) or "未知")
+    return JSONResponse(
+        status_code=422,
+        content={
+            "ok": False,
+            "code": "invalid_request",
+            "error": "请求参数不合法，请检查后重试。",
+            "detail": detail,
+            "trace_id": trace_id,
+        },
+    )
+
+
 @app.exception_handler(Exception)
 async def unhandled(request: Request, exc: Exception):
     """兜底异常处理 —— 保证前端拿到的永远是 JSON，且**不带内部细节**
@@ -209,6 +262,7 @@ async def unhandled(request: Request, exc: Exception):
 
 # ─────────────── 路由 ───────────────
 app.include_router(auth_router)          # 身份：访客码 / 绑定账号 / 登录
+# ★ 开源版不含管理面板（routers/admin.py 整块不在本仓库）
 app.include_router(image_router)
 app.include_router(templates_router)
 app.include_router(chat_router)

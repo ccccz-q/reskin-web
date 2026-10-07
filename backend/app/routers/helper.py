@@ -15,6 +15,9 @@ import sys
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException
+# ★ 同步的 LLM/看图调用必须丢进线程池，否则会卡住整个事件循环
+#   （本文件一度是全项目唯一没这么做的路由，压测才暴露出来）
+from fastapi.concurrency import run_in_threadpool         # noqa: E402
 from pydantic import BaseModel, Field
 
 if __package__ in (None, ""):
@@ -292,7 +295,7 @@ async def helper_chat(req: HelperChatRequest) -> dict:
             raise HTTPException(400, f"图片不在允许的目录内：{e}") from e
         if not path or not os.path.exists(path):
             raise HTTPException(404, "图片不存在")
-        got, degraded = _analyze_image(path)
+        got, degraded = await run_in_threadpool(_analyze_image, path)
         with_image = not degraded
         vision_ctx = (
             "\n\n──── 用户附上的照片，系统已分析（可直接引用；没看懂就如实说）────\n"
@@ -304,10 +307,19 @@ async def helper_chat(req: HelperChatRequest) -> dict:
 
     system_with_ctx = system + vision_ctx
     try:
-        # ★ 2026-10-06：改走 chat_interactive（总预算 60s + 空响应立刻换通道）。
+        # ★ 2026-06：改走 chat_interactive（总预算 60s + 空响应立刻换通道）。
         #   原先用 chat() 等于套了批量流水线的档位（单次 180s、主通道排 3 次），
         #   实测一次问答烧到 30.8s，其中 12s 花在明知会空的重试上。
-        reply = chat_interactive(
+        #
+        # ★★ 2026-10-06 压测发现：**必须丢进线程池**。
+        #   本函数是 `async def`，而 chat_interactive 是**同步阻塞**的 LLM 调用
+        #   （httpx 同步 client）。直接在协程里调 = 整个事件循环被卡住 3–15 秒，
+        #   期间**所有其他用户的请求全部排队** —— 实测 40 并发时连
+        #   /api/health 的 p50 都从<50ms 飙到 4.7s，并大批量超时。
+        #   本文件此前是全项目**唯一**零 run_in_threadpool 的路由，所以只有
+        #   压测能发现它：单测是顺序跑的，永远撞不出来。
+        reply = await run_in_threadpool(
+            chat_interactive,
             [{"role": "system", "content": system_with_ctx}, *history],
             temperature=0.4, max_tokens=500)
         audit("helper_chat", with_image=with_image, model=DEEPSEEK_MODEL)
@@ -410,7 +422,8 @@ async def recommend(req: RecommendRequest) -> dict:
     if not path or not os.path.exists(path):
         raise HTTPException(404, "图片不存在")
 
-    got, degraded = _analyze_image(path)          # 与对话路径共用同一份看图实现
+    got, degraded = await run_in_threadpool(
+        _analyze_image, path)          # 与对话路径共用同一份看图实现；同理由必须进线程池
     audit("helper_recommend", families=len(_family_catalog()),
           recommended=len(got.get("recommended") or []))
     return {"ok": True, "degraded": degraded, **got}

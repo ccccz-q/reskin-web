@@ -183,5 +183,91 @@ check("x 用了 1", guard.remaining_quota("x")["used"] == 1)
 check("y 不受影响", guard.remaining_quota("y")["used"] == 0)
 
 print()
+print("=== 9. generation_guard：归还由语言层面保证，不靠记得写 except ===")
+# ★ 2026-10-06 评审自查发现的真实漏洞：
+#   原来四个调用点各写各的 `except 特定异常: release_generation(...)`。
+#   而下游 image_generator 还会 raise ValueError（尺寸非法 / 返回体缺字段），
+#   那条路径**一个 release 都没有** → 用户没拿到图，额度却被扣到 TTL 到期。
+#   下面每条都模拟"没被预想的异常"，断言额度一定回来。
+
+# ① 正常提交
+guard.reset_quota("g1")
+with guard.generation_guard("g1") as g:
+    g.commit(size="1024x1024")
+check("① 提交后 used=1", guard.remaining_quota("g1")["used"] == 1,
+      str(guard.remaining_quota("g1")))
+
+# ② ★核心：抛出**完全没被预想**的异常，额度必须自动退还
+guard.reset_quota("g2")
+try:
+    with guard.generation_guard("g2") as g:
+        raise ValueError("尺寸非法：size 必须是三档之一")
+except ValueError:
+    pass
+check("② 未被预想的 ValueError 也退还了额度",
+      guard.remaining_quota("g2")["used"] == 0,
+      str(guard.remaining_quota("g2")))
+
+# ③ 同理，抛 BaseException 家族里更"野"的那种
+guard.reset_quota("g2b")
+try:
+    with guard.generation_guard("g2b") as g:
+        raise KeyboardInterrupt("模拟硬中断")
+except KeyboardInterrupt:
+    pass
+check("③ 连 KeyboardInterrupt 也不吞额度",
+      guard.remaining_quota("g2b")["used"] == 0,
+      str(guard.remaining_quota("g2b")))
+
+# ④ 没 commit 就走完流程（提前 return）→ 退还
+guard.reset_quota("g3")
+with guard.generation_guard("g3") as g:
+    got = g
+check("④ 未提交即退出 → 退还", guard.remaining_quota("g3")["used"] == 0,
+      str(guard.remaining_quota("g3")))
+
+# ⑤ commit 之后调用方自己 raise HTTPException（HTTP 层的常见写法）
+guard.reset_quota("g4")
+try:
+    with guard.generation_guard("g4") as g:
+        g.commit(size="1024x1024")
+        raise RuntimeError("提交后还要抛（比如审计写失败）")
+except RuntimeError:
+    pass
+q4 = guard.remaining_quota("g4")
+check("⑤ 已提交后抛异常：账不退（成功不可退）", q4["used"] == 1, str(q4))
+
+# ⑥ commit 不能重复（否则能凭空核销两次）
+guard.reset_quota("g5")
+with guard.generation_guard("g5") as g:
+    g.commit(size="1024x1024")
+    try:
+        g.commit(size="1024x1024")
+        check("⑥ 重复 commit 应抛错", False, "竟然成功了")
+    except RuntimeError:
+        check("⑥ 重复 commit 应抛错", True)
+check("⑥ 重复 commit 后账目没变", guard.remaining_quota("g5")["used"] == 1,
+      str(guard.remaining_quota("g5")))
+
+# ⑦ release 幂等：commit 过之后 finally 里再 release 是no-op（不会把账退掉）
+guard.reset_quota("g6")
+g6 = guard.new_generation_guard("g6", guard.reserve_generation("g6"))
+g6.commit(size="1024x1024")
+check("⑦ 已提交后 release 返回 None（没退账）", g6.release(reason="x") is None)
+check("⑦ 账目保持 1", guard.remaining_quota("g6")["used"] == 1,
+      str(guard.remaining_quota("g6")))
+
+# ⑧ 显式 release 两次，第二次是 no-op（不会凭空多退）
+guard.reset_quota("g7")
+g7 = guard.new_generation_guard("g7", guard.reserve_generation("g7"))
+first = g7.release(reason="失败")
+second = g7.release(reason="再退一次")
+check("⑧ 首次 release 有返回", first is not None)
+check("⑧ 二次 release 是 no-op", second is None)
+check("⑧ 只退了一次（used=0，没有变成负数）",
+      guard.remaining_quota("g7")["used"] == 0,
+      str(guard.remaining_quota("g7")))
+
+print()
 print(f"结果：{PASS} 通过 / {FAIL} 失败")
 sys.exit(1 if FAIL else 0)

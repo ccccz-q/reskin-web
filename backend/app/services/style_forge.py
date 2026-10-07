@@ -830,7 +830,20 @@ def forge(
     if not isinstance(doc, dict) or not doc:
         return {"ok": False, "error": "模型没有返回可解析的家族 JSON",
                 "evidence": evidence, "card": card}
-    doc = _normalize(doc)
+    # ★ 归一化不得让整条流水线归零（2026-10-07 端到端实测）：
+    #   _normalize 里任何一处对模型输出形状的假设不成立，都会以
+    #   AttributeError/TypeError 的形式冒到顶，**把已经花掉的 170 秒
+    #   与几十次调用全部作废**，而用户看到的只是"提炼失败"。
+    #   归一化的目的是"把脏形状擦干净"，它自己必须是**永不抛**的那一层。
+    try:
+        doc = _normalize(doc)
+    except Exception as e:                                    # noqa: BLE001
+        logger.error("家族模板归一化失败（模型输出形状异常）：%s: %s",
+                     type(e).__name__, e)
+        return {"ok": False,
+                "error": "模型返回的家族模板结构异常，没能整理成可用参数。"
+                          "可以点「重试」再试一次，或把风格描述写得更具体些。",
+                "evidence": evidence, "card": card}
 
     # ★ 出口收敛（10-03 复发修复；10-03 晚升级语义豁免 + 出厂检验）：所有分支
     #   的校验前必须走同一条「正向要求保护 → 残留拦截 → 校验 → QC」流水线。

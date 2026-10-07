@@ -190,12 +190,38 @@ async def chat_stream(request: Request, req: ChatRequest,
     abort_flag = threading.Event()
     _tid = merge_thread(req.thread_id, sid)   # ★ 公开版：header 会话优先（worker 闭包用）
 
+    # ★ 关键事件永不丢（2026-10-06 评审自查修复）。
+    #   满队列时如果把 `image` / `done` / `close` 丢了，前端会出现
+    #   「图已经生成好了，但界面一直转圈 / 报失败」——而且**不报错**，
+    #   是最难排查的一类症状。所以：非关键事件可丢（token 之类，
+    #   少几条不影响正确性），关键事件**腾出空间也要塞进去**。
+    _CRITICAL_EVENTS = frozenset({"image", "done", "close", "error"})
+
     def _put(event: str, data: Any) -> None:
         try:
             aq.put_nowait((event, data))
         except asyncio.QueueFull:
-            # 只在真满的时候丢，且必须留痕 —— 静默丢事件是最坑的
-            logger.error("SSE 队列已满，丢弃事件 %s（客户端消费过慢）", event)
+            if event in _CRITICAL_EVENTS:
+                # 丢一个最早的非关键事件腾位置（token 最先被丢，
+                # 它只是打字机效果，少几段不影响结论）
+                try:
+                    for _ in range(aq.qsize()):
+                        old_ev, old_data = aq.get_nowait()
+                        if old_ev not in _CRITICAL_EVENTS:
+                            logger.warning("SSE 队列已满，为保住 %s 丢弃 %s",
+                                           event, old_ev)
+                            aq.put_nowait((old_ev, old_data))   # 放回去（可能又满）
+                            break
+                    else:
+                        logger.warning("SSE 队列已满且全为关键事件，丢弃 %s", event)
+                except (asyncio.QueueEmpty, asyncio.QueueFull):
+                    pass
+                try:
+                    aq.put_nowait((event, data))
+                except asyncio.QueueFull:
+                    logger.error("SSE 队列已满，关键事件 %s 仍无处安放", event)
+            else:
+                logger.error("SSE 队列已满，丢弃事件 %s（客户端消费过慢）", event)
 
     def publish(event: str, data: Any = None) -> None:
         """从 worker 线程安全地投递到 asyncio 队列"""

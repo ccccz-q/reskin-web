@@ -35,6 +35,11 @@ import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
+# ★ Path 在下面 `_initialized_for: Path | None` 的注解里用到。
+#   此前**只写了注解没导入**：因为 `from __future__ import annotations` 让模块级
+#   变量注解不求值，所以侥幸没炸 —— 但只要有人把它改成类属性或函数签名注解，
+#   就是运行期 NameError。潜伏缺陷比崩溃更难查，所以补上导入。
+from pathlib import Path
 from typing import Any, Iterator
 
 if __package__ in (None, ""):
@@ -108,6 +113,55 @@ def _connect() -> sqlite3.Connection:
     # 这里是 FULL 语义才有性能损失，而我们并不需要那个性能）。
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
+
+
+def _read_user_version(conn: sqlite3.Connection) -> int:
+    """读 SQLite 文件头里的 schema 版本号（0 = 从未标记过）"""
+    try:
+        row = conn.execute("PRAGMA user_version").fetchone()
+        return int(row[0]) if row and row[0] is not None else 0
+    except sqlite3.DatabaseError:
+        return 0
+
+
+def _write_user_version(conn: sqlite3.Connection, version: int) -> None:
+    """把版本号写回文件头。
+
+    ★ 为什么现在才做（2026-10-06 评审自查发现）：
+      `SCHEMA_VERSION = 1` 这个常量从项目第一天就写在文件头，却**从来没有被读过**
+      —— 全库仅定义处一处出现。它给人一种"我们有版本管理"的错觉，
+      实际升级全靠 `_ensure_column()` 逐列幂等补：能用，但没有"能不能升级"的判据，
+      也没有降级路径（老代码碰到新库会怎样，没人知道）。
+
+    为什么存在 `user_version` 里而不是自建表：
+      它是 SQLite 文件头里的保留空间（字节 60-63），**不占任何表、不进 SELECT 列表**，
+      备份/替换整个 .db 文件时天然跟着走，也不会被用户的 SQL 意外改掉。
+    """
+    try:
+        conn.execute(f"PRAGMA user_version={int(version)}")
+    except sqlite3.DatabaseError as e:                # pragma: no cover
+        logger.warning("写入 schema 版本号失败：%s", e)
+
+
+def check_schema_version(conn: sqlite3.Connection | None = None) -> dict:
+    """比对文件里的版本与代码期望的版本 —— 供启动自检与测试使用
+
+    返回 {"file": int, "code": int, "ahead": bool}
+      · ahead=True  表示**库比代码新**（发布回滚了，或代码是旧副本）
+        —— 这是唯一危险的方向：新列/新表在旧代码里不存在，可能写入失败。
+      · file < code 是正常状态（老库被升级），由_ensure_column 兜着。
+    """
+    owned = conn is None
+    c = conn or _connect()
+    try:
+        cur = _read_user_version(c)
+    finally:
+        if owned:
+            try:
+                c.close()
+            except sqlite3.Error:
+                pass
+    return {"file": cur, "code": SCHEMA_VERSION, "ahead": cur > SCHEMA_VERSION}
 
 
 _FTS_TOKENIZER: str | None = None      # 已确认可用的分词器
@@ -306,6 +360,23 @@ def init_db(force: bool = False) -> None:
             _create_fts(conn)
             conn.commit()
             _self_heal_fts(conn)
+            # ★ 2026-10-06：真正把版本号写进文件头（见 _write_user_version 注释）。
+            #   顺序很讲究 —— **先做完所有补列/重建，最后才盖版本号**：
+            #   万一中途失败，文件里留的还是旧版本，下次启动会继续尝试升级；
+            #   如果先盖版本号，失败就会被误判成"已升级完成"。
+            ver = _read_user_version(conn)
+            if ver > SCHEMA_VERSION:
+                # 唯一危险的方向：库比代码新（发布回滚 / 拿了旧副本代码配新库）
+                logger.error("★ 数据库 schema 版本(%d) 高于当前代码(%d) —— "
+                             "可能是回滚了发布或代码没同步。旧代码不认识新列/新表，"
+                             "写入可能失败。请确认代码与数据库来自同一次发布。",
+                             ver, SCHEMA_VERSION)
+                audit("schema_version_ahead", file_version=ver,
+                      code_version=SCHEMA_VERSION)
+            elif ver < SCHEMA_VERSION:
+                logger.info("数据库 schema 升级：%d → %d", ver, SCHEMA_VERSION)
+            _write_user_version(conn, SCHEMA_VERSION)
+            conn.commit()
         finally:
             conn.close()
         _initialized_for = SQLITE_PATH
@@ -616,12 +687,6 @@ def history_for_llm(thread_id: str, limit: int = 40) -> list[dict]:
         out.append(m)
 
     return out
-    init_db()
-    with _open() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) c FROM messages WHERE thread_id=?", (thread_id,)
-        ).fetchone()
-    return int(row["c"]) if row else 0
 
 
 def _search_like(conn: sqlite3.Connection, thread_id: str, query: str, limit: int) -> list[dict]:

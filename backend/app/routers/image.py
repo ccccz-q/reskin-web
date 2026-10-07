@@ -20,8 +20,10 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import stat as stat_module   # S_ISREG：一次 stat 同时判"是不是文件"与取大小/时间
 import sys
 import threading
 from pathlib import Path
@@ -43,7 +45,9 @@ from agents.image_agent import (                                      # noqa: E4
 from config import ConfigMissing, IMAGE_STORAGE_DIR                  # noqa: E402
 from governance.guard import (                                       # noqa: E402
     GovernanceError,
+    new_generation_guard,
     release_generation,
+    remaining_quota,
     reserve_generation,
     settle_generation,
 )
@@ -215,54 +219,61 @@ async def generate(
     saved = await run_in_threadpool(validate_and_save, file, "upload", sid)
 
     # ② 治理：预扣额度 —— 检查与占位一次完成，避免并发穿过检查窗口
+    #    ★ 2026-10-06：归还改由 quota_guard 幂等负责（见 governance/guard.py
+    #      generation_guard 的说明）。此前这里只捕ConfigMissing 来 release，
+    #      而出图内部还会 raise ValueError —— 那类异常穿过 except，
+    #      票据就悬着不动：用户没拿到图、额度却一直被扣到 TTL 到期。
     try:
         token = reserve_generation(tid, reference_image=saved["path"])
     except GovernanceError as e:
         status = 429 if e.code == "quota_exhausted" else 403
         raise HTTPException(status, {"code": e.code, "message": str(e)}) from e
+    quota_guard = new_generation_guard(tid, token, reference_image=saved["path"])
 
-    # ③ 提炼创作卡 —— 出图路径本来就在花钱，多一次小调用换「反推 forbid」生效。
-    #    失败会自动退回本地档（见 card_extractor：VLM 挂了不该让出图挂掉）。
-    card = await run_in_threadpool(build_card, saved["path"], use_vlm=True)
-
-    # ④ 渲染提示词（走唯一入口）
-    parsed = _parse_params(params)
     try:
-        built = await run_in_threadpool(
-            build_prompt, source_id, parsed, card, extra_prompt, extra_mode,
-            _parse_locked(locked),
-        )
-    except (SourceNotFound, MissingRequiredParams, RenderFailure) as e:
-        release_generation(tid, token, reason="渲染失败")   # 钱还没花，退回去
-        if isinstance(e, SourceNotFound):
-            raise HTTPException(404, str(e)) from e
-        if isinstance(e, MissingRequiredParams):
-            raise HTTPException(422, {"code": "missing_params",
-                                      "missing": e.missing, "message": str(e)}) from e
-        raise HTTPException(500, f"渲染失败：{e}") from e
+        # ③ 提炼创作卡 —— 出图路径本来就在花钱，多一次小调用换「反推 forbid」生效。
+        #    失败会自动退回本地档（见 card_extractor：VLM 挂了不该让出图挂掉）。
+        card = await run_in_threadpool(build_card, saved["path"], use_vlm=True)
 
-    # ⑤ 出图（尺寸一律交给 resolve_size 决定，遵守「输出尺寸跟随原图」）
-    #    缺 key 是「依赖未就绪」而不是「程序出错」→ 503 而不是 500
-    try:
-        result = await run_in_threadpool(
-            generate_image_with_reference,
-            reference_image_path=saved["path"],
-            prompt=built["prompt"],
-            size=None,
-            aspect=_aspect_of(built),
-        )
-    except ConfigMissing as e:
-        # 「依赖未就绪」不是「程序出错」—— 配好 key 就能用，所以是 503
-        release_generation(tid, token, reason="缺少生图配置")
-        raise HTTPException(503, {"code": e.code, "message": str(e)}) from e
+        # ④ 渲染提示词（走唯一入口）
+        parsed = _parse_params(params)
+        try:
+            built = await run_in_threadpool(
+                build_prompt, source_id, parsed, card, extra_prompt, extra_mode,
+                _parse_locked(locked),
+            )
+        except (SourceNotFound, MissingRequiredParams, RenderFailure) as e:
+            if isinstance(e, SourceNotFound):
+                raise HTTPException(404, str(e)) from e
+            if isinstance(e, MissingRequiredParams):
+                raise HTTPException(422, {"code": "missing_params",
+                                          "missing": e.missing,
+                                          "message": str(e)}) from e
+            raise HTTPException(500, f"渲染失败：{e}") from e
 
-    if not result.get("success"):
-        release_generation(tid, token, reason=str(result.get("error"))[:200])
-        raise HTTPException(502, {"code": "generation_failed",
-                                  "message": result.get("error")})
+        # ⑤ 出图（尺寸一律交给 resolve_size 决定，遵守「输出尺寸跟随原图」）
+        #    缺 key 是「依赖未就绪」而不是「程序出错」→ 503 而不是 500
+        try:
+            result = await run_in_threadpool(
+                generate_image_with_reference,
+                reference_image_path=saved["path"],
+                prompt=built["prompt"],
+                size=None,
+                aspect=_aspect_of(built),
+            )
+        except ConfigMissing as e:
+            # 「依赖未就绪」不是「程序出错」—— 配好 key 就能用，所以是 503
+            raise HTTPException(503, {"code": e.code, "message": str(e)}) from e
 
-    quota = settle_generation(tid, token, size=result.get("size", ""),
-                              reference=saved["path"])
+        if not result.get("success"):
+            raise HTTPException(502, {"code": "generation_failed",
+                                      "message": result.get("error")})
+
+        # ⑥ 只有真的拿到图才核销预扣（语义与原settle_generation 一致）
+        quota = quota_guard.commit(size=result.get("size", ""))
+    finally:
+        # 已commit 过就是 no-op；任何异常/提前返回都在这里归还
+        quota_guard.release(reason="出图未完成")
     audit("http_generated", thread_id=tid, family=built.get("family_id"))
 
     return {
@@ -362,24 +373,26 @@ async def repair(
     prompt = _build_repair_prompt(
         change, build_repair_constraints(extra_prompt, family_id))
 
+    # ★ 与 /generate 同一套归还保证：release 幂等，放在 finally 里
+    quota_guard = new_generation_guard(tid, token, reference_image=ref_path)
     try:
-        result = await run_in_threadpool(
-            generate_image_with_reference,
-            reference_image_path=ref_path,
-            prompt=prompt,
-            size=None,                    # 尺寸跟随参考图（上一版成品）
-        )
-    except ConfigMissing as e:
-        release_generation(tid, token, reason="缺少生图配置")
-        raise HTTPException(503, {"code": e.code, "message": str(e)}) from e
+        try:
+            result = await run_in_threadpool(
+                generate_image_with_reference,
+                reference_image_path=ref_path,
+                prompt=prompt,
+                size=None,                    # 尺寸跟随参考图（上一版成品）
+            )
+        except ConfigMissing as e:
+            raise HTTPException(503, {"code": e.code, "message": str(e)}) from e
 
-    if not result.get("success"):
-        release_generation(tid, token, reason=str(result.get("error"))[:200])
-        raise HTTPException(502, {"code": "generation_failed",
-                                  "message": result.get("error")})
+        if not result.get("success"):
+            raise HTTPException(502, {"code": "generation_failed",
+                                      "message": result.get("error")})
 
-    quota = settle_generation(tid, token, size=result.get("size", ""),
-                              reference=ref_path)
+        quota = quota_guard.commit(size=result.get("size", ""))
+    finally:
+        quota_guard.release(reason="修复未完成")
     audit("http_repaired", thread_id=tid, change=change[:60])
     return {
         "ok": True,
@@ -486,47 +499,57 @@ def _gallery_sync(limit: int, sid: str = DEFAULT_SESSION,
         roots = [IMAGE_STORAGE_DIR / sid, IMAGE_STORAGE_DIR / "_seed"]
 
     items: list[dict] = []
+    # ★★ 遍历方式的改造（2026-10-07 压测实测：1623 个文件要 1.4s）
+    #   旧写法有两个硬伤：
+    #     ① 每个文件**两次 stat** —— `p.is_file()` 一次、`p.stat()` 又一次。
+    #        rglob 出来的路径已经是我们要的，直接 stat 一次、用 S_ISREG 判类型即可。
+    #     ② `.thumbs` 等派生目录**进了目录才被逐个文件丢掉** ——
+    #        等于把整个缩略图目录 rglob 一遍再 discard，白扫。
+    #   改成 os.walk 并在**遍历期剪枝**：派生目录根本不会走下去。
+    #   实测两项合计把画廊扫描从 O(2N stat + 派生目录全遍历) 降到 O(N stat)。
     for root in roots:
         if not root.exists():
             continue
-        # 早停：rglob 全目录 + 每个文件 stat() 是随文件数线性增长的同步 IO，
-        # 文件多了会拖慢整个事件循环（所以整个函数丢在线程池里跑，见函数签名处）。
-        for p in root.rglob("*"):
-            if not p.is_file():
-                continue
-            if p.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
-                continue
-            # ★ 跳过派生缓存目录：.thumbs 里是缩略图（也是 jpg），
-            #   不跳过的话它们会涌进画廊列表 —— 实测 52 条，
-            #   把种子图和真实作品挤出 limit 上限（截图里作品流空白的帮凶）。
-            if any(part.startswith(".") for part in p.relative_to(root).parts):
-                continue
-            # ★ 退役种子图（2026-10-05 用户要求把首屏重复图真正下掉）：
-            #   平台是"上传覆盖"语义，包里删文件线上不会消失，所以退役图
-            #   仍躺在磁盘上；靠这份名单在**列表层**跳过，首屏与仓库就都是 17 张。
-            if is_retired_seed(p):
-                continue
-            # 相对存储根的路径段：判定 seed（公共展示图）与所属子目录
-            rel_root = p.relative_to(IMAGE_STORAGE_DIR)
-            kind = (
-                "seed" if ("_seed" in rel_root.parts or "seed" in rel_root.parts)
-                else "generated" if p.name.startswith("gen_")
-                else "upload"
-            )
-            if kinds and kind not in kinds:      # ★ 截断前过滤（见 docstring）
-                continue
-            try:
-                st = p.stat()
-            except OSError:
-                continue
-            items.append({
-                "url": to_url(p),
-                "filename": p.name,
-                "kind": kind,
-                "bytes": st.st_size,
-                "modified": datetime.fromtimestamp(st.st_mtime).isoformat(timespec="seconds"),
-                "subdir": rel_root.parent.as_posix(),
-            })
+        for dirpath, dirnames, filenames in os.walk(root):
+            # ★ 遍历期剪枝：派生缓存目录（.thumbs 等）整棵跳过，
+            #   不再"进去了再逐个文件判断后丢弃"。
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for fn in filenames:
+                # ★ 先看后缀（零IO），再 stat —— 顺序反了会白白多花一次 stat
+                if Path(fn).suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+                    continue
+                fp = Path(dirpath) / fn
+                try:
+                    st = fp.stat()          # 一次 stat 同时解决"是不是文件"与"大小/时间"
+                except OSError:
+                    continue
+                if not stat_module.S_ISREG(st.st_mode):
+                    continue
+                # ★ 退役种子图（2026-10-05 用户要求把首屏重复图真正下掉）：
+                #   平台是"上传覆盖"语义，包里删文件线上不会消失，所以退役图
+                #   仍躺在磁盘上；靠这份名单在**列表层**跳过，首屏与仓库就都是 17 张。
+                if is_retired_seed(fp):
+                    continue
+                try:
+                    rel_root = fp.relative_to(IMAGE_STORAGE_DIR)
+                except ValueError:
+                    continue
+                kind = (
+                    "seed" if ("_seed" in rel_root.parts or "seed" in rel_root.parts)
+                    else "generated" if fn.startswith("gen_")
+                    else "upload"
+                )
+                if kinds and kind not in kinds:      # ★ 截断前过滤（见 docstring）
+                    continue
+                items.append({
+                    "url": to_url(fp),
+                    "filename": fn,
+                    "kind": kind,
+                    "bytes": st.st_size,
+                    "modified": datetime.fromtimestamp(st.st_mtime).isoformat(
+                        timespec="seconds"),
+                    "subdir": rel_root.parent.as_posix(),
+                })
     items.sort(key=lambda x: x["modified"], reverse=True)
     cap = max(1, min(limit, 500))
     return {"count": len(items[:cap]), "items": items[:cap]}
@@ -538,6 +561,14 @@ _GALLERY_TTL = 15.0          # 列表缓存秒数：仓库打开频繁、目录�
 #   桶数上限：防匿名访客无限增长（见 gallery() 内的淘汰逻辑）
 _GALLERY_MAX_BUCKETS = 128
 _gallery_cache: dict[str, dict] = {}
+# ★ 扫描单飞锁（防缓存击穿，见 gallery() 里的说明）。
+#   ★★ 这里**必须用 asyncio.Lock，不能用 threading.Lock** ——
+#      第一版写成了 threading.Lock，结果更糟：p50 从 25s 变成 **60s 全超时**。
+#      原因很直白：`threading.Lock.acquire()` 是**阻塞**调用，写在协程里
+#      会把整个事件循环卡住，别人连"等锁"都做不到 —— 锁没解决击穿，
+#      反而把整个服务冻住了（这正是「在 async 里用同步锁」这个经典错误）。
+#      asyncio.Lock 的等待是**挂起协程**而不是卡线程，持有它跨 await 是安全的。
+_gallery_scan_lock = asyncio.Lock()
 
 
 @router.get("/gallery", summary="列出最近的图片（按会话隔离 + 公共展示图）")
@@ -566,18 +597,29 @@ async def gallery(limit: int = 24, kinds: str = "", force: bool = False,
         oldest = min(_gallery_cache, key=lambda k: _gallery_cache[k]["ts"])
         if oldest != sid:                      # 极端并发下别把自己刚建的桶丢了
             _gallery_cache.pop(oldest, None)
-    cached = bucket["data"]
-    fresh = cached is not None and (now - bucket["ts"]) < _GALLERY_TTL
-    if force or not fresh:
-        allow = {k.strip() for k in kinds.split(",") if k.strip()} if kinds else None
-        items = await run_in_threadpool(_gallery_sync, 500, sid, allow)
-        bucket["ts"] = now
-        bucket["data"] = items
-        # 后台预热缩略图（fire-and-forget）：用户点开仓库前，缩略图已在磁盘
-        _threading.Thread(target=_prewarm_thumbs, args=(items["items"],),
-                          name="thumb-prewarm", daemon=True).start()
-    else:
-        items = cached
+    # ★ 单飞（single-flight）—— 2026-10-06 压测发现的缓存击穿
+    #   现象：缓存命中率明明很高，并发 40 时 /api/image/gallery 的 p50 却是
+    #   **25 秒**、吞吐只有 1.5 req/s（同机器上 /api/families 有 230 req/s）。
+    #   原因：40 个请求在同一瞬间**全部 miss**，于是同时去 rglob 全目录 + 逐个
+    #   stat，把磁盘 IO 和 GIL 一起打满。缓存本身没问题，问题是"没命中之后没人排队"。
+    #   做法：扫描这一步用进程内锁串行化，后来者直接拿**别人刚扫完的结果**——
+    #   等于把 N 次全量扫描压成 1 次。
+    #   （force=true 不参与复用：它是"刚生成完要立刻看到新图"的旁路。）
+    if force or bucket["data"] is None \
+            or (_time.monotonic() - bucket["ts"]) >= _GALLERY_TTL:
+        async with _gallery_scan_lock:
+            need_scan = force or bucket["data"] is None or (
+                (_time.monotonic() - bucket["ts"]) >= _GALLERY_TTL)
+            if need_scan:
+                allow = {k.strip() for k in kinds.split(",") if k.strip()} \
+                    if kinds else None
+                bucket["data"] = await run_in_threadpool(
+                    _gallery_sync, 500, sid, allow)
+                bucket["ts"] = _time.monotonic()
+    items = bucket["data"]
+    # 后台预热缩略图（fire-and-forget）：用户点开仓库前，缩略图已在磁盘
+    _threading.Thread(target=_prewarm_thumbs, args=(items["items"],),
+                      name="thumb-prewarm", daemon=True).start()
     allow = {k.strip() for k in kinds.split(",") if k.strip()} if kinds else None
     if allow:
         items = {**items, "items": [x for x in items["items"] if x["kind"] in allow],

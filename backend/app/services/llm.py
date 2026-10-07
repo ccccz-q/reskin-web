@@ -15,9 +15,11 @@
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
+import socket
 import sys
 import time
 from typing import Any, NamedTuple
@@ -47,6 +49,18 @@ from config import (                                    # noqa: E402
     VISION_MODEL,
 )
 from infra.logging import logger                        # noqa: E402
+
+# ── JSON 抢救/解析已拆到独立模块，这里 re-export 保持旧入口 ──
+#★ 2026-10-06 god module 拆分（第五刀）：`_close_truncated` / `extract_json`
+#   / `extract_json_lenient` 是**纯函数**，搬去了 services/json_repair.py。
+#   但 tests 直接 import 了 llm._close_truncated 等私有名
+#   （test_llm_resilience / test_card 都用了），所以这里必须原样re-export。
+#   拆文件不能变成打断别人的引用 —— 要改的是"住在哪"，不是"叫什么"。
+from services.json_repair import (                        # noqa: E402,F401
+    _close_truncated,
+    extract_json,
+    extract_json_lenient,
+)
 
 # ── 遗留别名 ──────────────────────────────────────────────
 # 本模块内部已改用「通道 + 缓存客户端」（见 _client_for），
@@ -83,194 +97,6 @@ if not (DEEPSEEK_API_KEY or PREMIUM_API_KEY):
 class LLMError(Exception):
     """LLM 调用失败 —— 携带原始错误类型，便于区分网络 / 鉴权 / 超长"""
 
-
-def _close_truncated(raw: str) -> str:
-    """把「被 max_tokens 截断」的 JSON 尽量补成合法的
-
-    ★ 来历（2026-10-03 实测）：VLM 提炼 card 时 max_tokens=500 不够用，
-      模型刚写完 anchors 就被掐断 —— 整段 JSON 少了结尾的括号。
-      旧行为是 `extract_json` 返回 None → VLM 档被整段丢掉（**这次调用的钱白花了**），
-      card 退回只有色板的本地档，秋毫必现的「反推 forbid」再次失效。
-      与其重来一次（再花钱、再等两分钟），不如把已经到手的完整片段救回来。
-
-    三步：① 结尾落在字符串里 → 补个引号；② 去掉悬空的逗号/冒号；
-          ③ 按未闭合的括号栈反向补齐。
-    """
-    s = raw.rstrip()
-
-    # ⓪ 先砍掉末尾"刚开了头"的结构：`...,{` 这种半截片段修补出来只会是一个空对象。
-    #    注意**不**砍引号 —— `{"a":"未写完` 结尾的引号是有信息量的，砍了反而救不回来。
-    while s and s[-1] in ",{[:":
-        s = s[:-1].rstrip()
-
-    # ① 扫描一遍看结尾是否在字符串内部（不能用 count('"') % 2 —— 遇转义引号就错）
-    in_str = False
-    esc = False
-    stack: list[str] = []
-    for ch in s:
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch in "{[":
-            stack.append(ch)
-        elif ch in "}]" and stack:
-            stack.pop()
-    if in_str:
-        s += '"'
-
-    # ② 悬空的分隔符：`{"a":1,` 或 `{"a":` 后面的东西是残缺的
-    while s and s[-1] in ",:":
-        s = s[:-1].rstrip()
-
-_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
-
-
-def extract_json(text: str) -> dict | None:
-    """从模型输出里稳健地取出 JSON
-
-    模型偶尔会：加 ```json 围栏 / 前后加寒暄 / 输出对象后还附带解释。
-    所以按「围栏 → 最外层花括号配对扫描」两级尝试，而不是简单 json.loads。
-    """
-    if not text:
-        return None
-    raw = text.strip()
-
-    fence = _JSON_FENCE_RE.search(raw)
-    if fence:
-        raw = fence.group(1).strip()
-
-    try:
-        obj = json.loads(raw)
-        return obj if isinstance(obj, dict) else None
-    except json.JSONDecodeError:
-        pass
-
-    start = raw.find("{")
-    if start < 0:
-        return None
-    depth = 0
-    in_str = False
-    esc = False
-    for i in range(start, len(raw)):
-        ch = raw[i]
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                try:
-                    obj = json.loads(raw[start:i + 1])
-                    return obj if isinstance(obj, dict) else None
-                except json.JSONDecodeError:
-                    return None
-    return None
-
-
-def _close_truncated(raw: str) -> str:
-    """把「被 max_tokens 截断」的 JSON 尽量补成合法的
-
-    ★ 来历（2026-10-03 实测）：VLM 提炼 card 时 max_tokens=500 不够用，
-      模型刚写完 anchors 就被掐断 —— 整段 JSON 少了结尾的括号。
-      旧行为是 `extract_json` 返回 None → VLM 档被整段丢掉
-      （**这次调用的钱白花了**），card 退回只有色板的本地档，
-      秋毫必现的「反推 forbid」再次失效。
-      与其重来一次（再花钱、再等两分钟），不如把已经到手的完整片段救回来。
-
-    三步：⓪ 砍掉末尾刚开了头的片段；① 结尾落在字符串里就补个引号；
-          ② 去掉悬空的逗号/冒号；③ 按未闭合的括号栈反向补齐。
-    """
-    s = raw.rstrip()
-
-    # ⓪ 先砍掉末尾"刚开了头"的结构：`...,{` 这种半截片段修补出来只会是一个空对象。
-    #    注意**不**砍引号 —— `{"a":"未写完` 结尾的引号是有信息量的，砍了反而救不回来。
-    while s and s[-1] in ",{[:":
-        s = s[:-1].rstrip()
-
-    # ① 扫描一遍看结尾是否在字符串内部（不能用 count('"') % 2 —— 遇转义引号就错）
-    in_str = False
-    esc = False
-    stack: list[str] = []
-    for ch in s:
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch in "{[":
-            stack.append(ch)
-        elif ch in "}]" and stack:
-            stack.pop()
-    if in_str:
-        s += '"'
-
-    # ② 悬空的分隔符：`{"a":1,` 或 `{"a":` 后面的东西是残缺的
-    while s and s[-1] in ",:":
-        s = s[:-1].rstrip()
-
-    # ③ 补齐容器
-    for opener in reversed(stack):
-        s += "]" if opener == "[" else "}"
-    return s
-
-
-def extract_json_lenient(text: str) -> dict | None:
-    """比 extract_json 多一层：允许 JSON 被截断
-
-    只在**明确预期会截断**的场合使用（目前是 VLM 提炼 card）；
-    其它地方（工具 arguments、样式提炼）坚持用严格的 extract_json ——
-    那里宁可判为「解析不了」，也不要悄悄接受一个残缺的参数表。
-
-    策略：先严格解析；不行就逐步砍掉最后一个"写到一半"的片段再补齐括号。
-    每一步都要求产出**合法的 dict**，绝不含糊地返回半截对象。
-    """
-    strict = extract_json(text)
-    if strict is not None:
-        return strict
-
-    raw = (text or "").strip()
-    fence = _JSON_FENCE_RE.search(raw)
-    if fence:
-        raw = fence.group(1).strip()
-    start = raw.find("{")
-    if start < 0:
-        return None
-    candidate = raw[start:]
-
-    for _ in range(40):
-        try:
-            obj = json.loads(_close_truncated(candidate))
-        except json.JSONDecodeError:
-            obj = None
-        if isinstance(obj, dict):
-            return obj
-        # 再退一步：砍掉最后一个未写完的元素，重试
-        cut = max(candidate.rfind(","), candidate.rfind("{"), candidate.rfind("["))
-        if cut <= start:
-            break
-        candidate = candidate[:cut]
-    return None
 
 
 # ════════════ 通道（Channel）════════════
@@ -575,6 +401,40 @@ _TRANSIENT_HINTS = (
 )
 _TRANSIENT_STATUS = frozenset({429, 502, 503, 504})
 
+# ★ 网络层异常：既没有 status_code，文案也不一定能命中上面的关键词
+#   （2026-10-06 补并发/异常测试时才发现的漏判）
+#
+#   现象：`_is_transient` 逐条对照 status_code 与文案关键词，于是
+#     ConnectionError("Connection refused")     → 判为**确定性失败**
+#     socket.gaierror("getaddrinfo failed")    → 判为**确定性失败**
+#   后果：中转站临时拒连 / DNS 抖动时，用户的请求**立刻失败**，
+#   既不重试也不换通道 —— 而这类抖动本来就是"重试一次就好"。
+#   `_run_resilient` 里`not _is_transient(e)` 会直接 raise，
+#   等于把网络抖动弹成了"配置错了/请求写错了"。
+#
+#   为什么不用「凡是 OSError 都算瞬时」：本进程也用 OSError 做文件读写
+#   （文件不存在、权限不足），那些是**确定性**的，重试毫无意义。
+#   所以只认①明确的网络异常类型 ②网络相关的 errno。
+_NETWORK_EXC_TYPES: tuple[type[BaseException], ...] = (
+    ConnectionError,      # 含 ConnectionRefused / Reset / Aborted / BrokenPipe
+    TimeoutError,         # socket 超时（connect/read）
+    socket.gaierror,      # DNS 解析失败
+    socket.herror,        # 主机名解析失败（部分平台）
+)
+_NETWORK_ERRNOS = frozenset({
+    errno.ECONNRESET, errno.ECONNREFUSED, errno.ECONNABORTED,
+    errno.EHOSTUNREACH, errno.ENETUNREACH, errno.ENETDOWN,
+    errno.ETIMEDOUT, errno.EPIPE, errno.ENOTCONN,
+})
+
+
+def _looks_like_network_error(e: BaseException) -> bool:
+    """是不是"网络层"失败 —— 值得原样重试一次（换个通道多半更好）"""
+    if isinstance(e, _NETWORK_EXC_TYPES):
+        return True
+    en = getattr(e, "errno", None)
+    return en is not None and en in _NETWORK_ERRNOS
+
 # ★ 中转站的「假 400」——必须重试，不能当确定性失败（2026-10-04 用户实测）
 #
 # 现象：每次会话的**第一次**生成必弹 `BadRequestError: Error code: 400`，
@@ -628,6 +488,10 @@ def is_gateway_busy(e: Exception) -> bool:
 
 
 def _is_transient(e: Exception) -> bool:
+    # ★ 网络层优先判：拒连/DNS 失败没有 status_code，文案也不一定命中关键词，
+    #   放最后会被当成"确定性失败"直接 raise（见 _NETWORK_EXC_TYPES 注释）
+    if _looks_like_network_error(e):
+        return True
     s = str(e).lower()
     if any(h in s for h in _TRANSIENT_HINTS):
         return True
@@ -643,6 +507,10 @@ def _is_transient(e: Exception) -> bool:
 
 
 def _looks_like_timeout(e: Exception) -> bool:
+    # 类型也看一眼：TimeoutError("") 这种**空文案**的超时，
+    # 只靠 `"timeout" in str(e)` 会漏判（SDK 包装后文案可能为空）
+    if isinstance(e, TimeoutError):
+        return True
     s = str(e).lower()
     return "timeout" in s or "timed out" in s
 

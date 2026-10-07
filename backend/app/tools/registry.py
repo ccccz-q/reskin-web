@@ -32,6 +32,7 @@ from contracts.tools import (                                        # noqa: E40
 )
 from governance.guard import (                                        # noqa: E402
     GovernanceError,
+    new_generation_guard,
     release_generation,
     reserve_generation,
     settle_generation,
@@ -342,44 +343,54 @@ def tool_generate_image(args: dict, ctx: ToolContext) -> dict:
             "hint": "这是治理策略拦截，不是程序错误，不要尝试重试。",
         }
 
-    built = safe_build(family_id, params, ctx.card,
-                        extra_prompt=ctx.extra_prompt,
-                        extra_mode=ctx.extra_mode)
-    if not built.get("ok"):
-        # 提示词都没渲染出来，钱还没花出去 → 把预扣的额度退回去
-        release_generation(ctx.thread_id, token, reason="渲染失败")
-        return {
-            "error": built.get("error"),
-            "missing": built.get("missing", []),
-            "hint": "先用 render_prompt 确认参数能通过再生成，避免白花钱。",
-        }
+    # ★ 2026-10-06：归还改由幂等的 quota_guard 负责（governance/guard.py）。
+    #   此前这里是「每个失败分支各写一次 release_generation」，漏一个分支
+    #   就等于吞掉用户额度；而下游 generate_image_with_reference 还会
+    #   raise ValueError（尺寸非法 / 上游返回体缺字段），那条路径**一个
+    #   release 都没有** —— 工具以异常终止，Agent 看到的是"工具崩了"，
+    #   额度却一直被扣着。现在 finally 一道兜住，新增异常类型也不漏。
+    quota_guard = new_generation_guard(ctx.thread_id, token,
+                                       reference_image=ctx.image_path)
+    try:
+        built = safe_build(family_id, params, ctx.card,
+                            extra_prompt=ctx.extra_prompt,
+                            extra_mode=ctx.extra_mode)
+        if not built.get("ok"):
+            # 提示词都没渲染出来，钱还没花出去 → 预扣自动退还
+            return {
+                "error": built.get("error"),
+                "missing": built.get("missing", []),
+                "quota": quota_guard.release(reason="渲染失败"),
+                "hint": "先用 render_prompt 确认参数能通过再生成，避免白花钱。",
+            }
 
-    prompt = built["prompt"]
-    family = _family_doc(built.get("family_id") or family_id)
-    aspect = (family or {}).get("default_aspect")
+        prompt = built["prompt"]
+        family = _family_doc(built.get("family_id") or family_id)
+        aspect = (family or {}).get("default_aspect")
 
-    with step("Agent 出图", family=built.get("family_id"), thread=ctx.thread_id):
-        result = generate_image_with_reference(
-            reference_image_path=ctx.image_path,
-            prompt=prompt,
-            size=None,                 # ★ 尺寸由 resolve_size 决定，遵守「跟随原图」
-            aspect=aspect,
+        with step("Agent 出图", family=built.get("family_id"), thread=ctx.thread_id):
+            result = generate_image_with_reference(
+                reference_image_path=ctx.image_path,
+                prompt=prompt,
+                size=None,             # ★ 尺寸由 resolve_size 决定，遵守「跟随原图」
+                aspect=aspect,
+            )
+
+        if not result.get("success"):
+            # 失败要凭预扣票据退还 —— 失败了还扣用户的额度是不讲理的
+            return {
+                "error": result.get("error"),
+                "quota": quota_guard.release(
+                    reason=str(result.get("error"))[:200]),
+                "hint": "生成失败，额度已退还。可以调整参数后再试，或换个家族。",
+            }
+
+        quota = quota_guard.commit(
+            size=result.get("size", ""),
         )
-
-    if not result.get("success"):
-        # 失败要凭预扣票据退还 —— 失败了还扣用户的额度是不讲理的
-        quota = release_generation(
-            ctx.thread_id, token, reason=str(result.get("error"))[:200]
-        )
-        return {
-            "error": result.get("error"),
-            "quota": quota,
-            "hint": "生成失败，额度已退还。可以调整参数后再试，或换个家族。",
-        }
-
-    quota = settle_generation(
-        ctx.thread_id, token, size=result.get("size", ""), reference=ctx.image_path
-    )
+    finally:
+        # 已 commit 就是 no-op；任何异常 / 提前 return 都在这里退还
+        quota_guard.release(reason="出图未完成")
     ctx.artifacts["image_url"] = result.get("url")
     ctx.artifacts["image_path"] = result.get("image_path")
     ctx.artifacts["family_id"] = built.get("family_id")
@@ -529,26 +540,28 @@ def tool_repair_image(args: dict, ctx: ToolContext) -> dict:
     prompt = _build_repair_prompt(
         change, build_repair_constraints(ctx.extra_prompt,
                                          str(ctx.artifacts.get("family_id") or "")))
-    with step("Agent 修复出图", thread=ctx.thread_id, change=change[:40]):
-        result = generate_image_with_reference(
-            reference_image_path=last_image,       # ★ 参考图 = 上一版成品
-            prompt=prompt,
-            size=None,
-        )
+    # ★ 与 generate_image 同一套归还保证（幂等 + finally）
+    quota_guard = new_generation_guard(ctx.thread_id, token,
+                                       reference_image=last_image)
+    try:
+        with step("Agent 修复出图", thread=ctx.thread_id, change=change[:40]):
+            result = generate_image_with_reference(
+                reference_image_path=last_image,       # ★ 参考图 = 上一版成品
+                prompt=prompt,
+                size=None,
+            )
 
-    if not result.get("success"):
-        quota = release_generation(
-            ctx.thread_id, token, reason=str(result.get("error"))[:200]
-        )
-        return {
-            "error": result.get("error"),
-            "quota": quota,
-            "hint": "修复失败，额度已退还。可以让用户换个说法描述问题后再试。",
-        }
+        if not result.get("success"):
+            return {
+                "error": result.get("error"),
+                "quota": quota_guard.release(
+                    reason=str(result.get("error"))[:200]),
+                "hint": "修复失败，额度已退还。可以让用户换个说法描述问题后再试。",
+            }
 
-    quota = settle_generation(
-        ctx.thread_id, token, size=result.get("size", ""), reference=last_image
-    )
+        quota = quota_guard.commit(size=result.get("size", ""))
+    finally:
+        quota_guard.release(reason="修复未完成")
     # ★ 新图顶替旧图成为「最新生成结果」—— 连续修复（修完一处再修另一处）天然成立
     ctx.artifacts["image_url"] = result.get("url")
     ctx.artifacts["image_path"] = result.get("image_path")

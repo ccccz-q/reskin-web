@@ -1,52 +1,75 @@
 # ═══════════════════════════════════════════════════════════
-# .gitignore —— 什么该进仓库，什么不该，写清楚理由
+# .gitignore —— 什么该进版本库，什么坚决不进
 # ═══════════════════════════════════════════════════════════
 
-# ── 密钥 ─────────────────────────────────────────────────
+# ── 密钥与本地配置（最要紧的一条）────────────────────
 .env
 .env.*
-!.env.example          # 模板要进仓库（里面没有真实值）
+!.env.example
+.env.bak*
 
-# ── Python ───────────────────────────────────────────────
+# ── 依赖与构建产物 ──────────────────────────────────
+node_modules/
+frontend/dist/
 __pycache__/
 *.py[cod]
 *.egg-info/
 .venv/
 venv/
-*.sqlite3
 
-# ── 运行时产物 ────────────────────────────────────────────
-# 用户上传 / 生成的图片，以及 SQLite 与审计日志：都不是源码
+# ── 运行期数据：用户图片、数据库、审计日志 ───────────
 storage/
 backend/storage/
 logs/
 *.log
-
-# 测试跑出来的临时图片（跑一次 tests/run_all.py 就会生成几十张）
-# ★ 与私库保持同一条规则：漏了它，一次测试就会把几十张图混进下次提交。
-backend/tests/_img_tmp/
-
-# 历史遗留：LangGraph 的 SqliteSaver 曾在这里留下一个 678MB 的 agent.db，
-# 这类「运行时数据库」本来就不该跟着项目走。
 *.db
 *.db-wal
 *.db-shm
 
-# ── 前端 ─────────────────────────────────────────────────
-node_modules/
-frontend/dist/
-frontend/.vite/
-.vite/
+# ── 本地调试/走查脚本产物 ────────────────────────────
+backend/_*.py
+backend/tests/_img_tmp/
+backend/tests/_*.png
+backend/_*.mjs
+backend/*.log
+backend/tests/*.log
+backend/tests/run_all.log
+frontend/.playwright-cli/
+.playwright-cli/
+ux_*.png
+start_*.png
+now.yaml
+page-*.yml
+*.bak*
 
-# ── 编辑器 / 系统 ─────────────────────────────────────────
+# ── 归档（个人测试数据，不进库）─────────────────────
+_archive_*/
+
+# ── 编辑器与系统 ────────────────────────────────────
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
 
-# ── 临时文件 ─────────────────────────────────────────────
+# ── 临时文件 ────────────────────────────────────────
 _t/
 *.tmp
 
-# .env 备份（改动前的快照，含真实密钥，绝不入库）
-.env.bak*
+# ── 发布产物副本（打包器输出，可由 deploy/build_release.py 重新生成）──
+# ★ 2026-10-06 改通配：原来只写死 deploy/release/，于是新目录
+#   deploy/release_20261006/（打包器 RELEASE_OUT 用）差点连同真实 .env 入库。
+#   教训：产物目录的名字会变，忽略规则不能跟着一个个补。
+deploy/release*/
+deploy/publish_*/
+
+# ★ 2026-10-06 修正：下面两行原来是 "!deploy/public_storage/" 与 "!deploy/*.png"
+#   （反向规则 = 强制入库），于是 28 个公共素材文件 + 5 张一次性截图一直被跟踪，
+#   .git 撑到 49MB。已 git rm --cached 移出索引（磁盘文件保留）。
+#   判断标准是「是不是可再生的产物」，而不是「是不是打包器的输入」：
+#     · public_storage/ 的种子图是运行期生成物的副本，可由后端重新产出；
+#     · deploy/*.png 是 S3 联调 / TOTP 调试的一次性截图，没有复用价值。
+#   只保留打包器与清洗脚本本身（那是源）。
+deploy/public_storage/
+deploy/*.png
+!deploy/build_release.py
+!deploy/prepare_public.py

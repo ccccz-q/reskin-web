@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 
+import time
 from functools import lru_cache
 from pathlib import Path
 
@@ -198,6 +199,15 @@ def clear_cache() -> None:
     _cached.cache_clear()
     _id_index.cache_clear()          # 索引与文档必须同生同灭，否则装新家族后查不到
 
+    # ★ inventory 的 TTL 缓存必须与文档缓存**同生同死**（2026-10-06 加缓存时踩到）：
+    #   测试「造一个坏 YAML → 期望 inventory 报healthy=False」当场变红 ——
+    #   文档缓存清了、inventory 缓存没清，于是它端出 10 秒前的旧快照。
+    #   这类"两个缓存只清一个"的错位很难靠读代码发现，症状是"测试偶尔红"。
+    _inv = globals().get("_inventory_cache")
+    if isinstance(_inv, dict):
+        _inv["ts"] = 0.0
+        _inv["data"] = None
+
 
 # ─────────────── 对外 API ───────────────
 
@@ -228,14 +238,30 @@ def get_family_by_id(family_id: str) -> dict | None:
     return dict(d) if d else None
 
 
-def inventory() -> dict:
-    """给健康检查用的清单：确认所有文档都被正确识别"""
+_inventory_cache: dict = {"ts": 0.0, "data": None}
+_INVENTORY_TTL = 10.0        # 秒。模板极少变动，且有 /api/templates/reload 手动刷新
+
+
+def inventory(force: bool = False) -> dict:
+    """给健康检查用的清单：确认所有文档都被正确识别
+
+    ★ 为什么加 TTL 缓存（2026-10-06 压测发现）：
+      本函数会**重读全部 YAML**再统计。/api/health 每次请求都调它，
+      于是单请求 85ms —— 在40 并发下被串行化成 p50 2.9s、吞吐 8.7 req/s，
+      成为一个"谁都在用、但没人快"的瓶颈（同机器 /api/families 有 104 req/s）。
+      模板文件是**部署期产物、运行期基本不变**的，10 秒的延迟完全可接受；
+      需要立刻生效时走 /api/templates/reload（它会调 force=True 清缓存）。
+    """
+    now = time.monotonic()
+    if not force and _inventory_cache["data"] is not None \
+            and (now - _inventory_cache["ts"]) < _INVENTORY_TTL:
+        return _inventory_cache["data"]
     all_docs = load_documents()
     by_kind: dict[str, list[str]] = {}
     for d in all_docs:
         by_kind.setdefault(d["_kind"], []).append(d["id"])
     errs = load_errors()
-    return {
+    out = {
         "templates_dir": str(Path(TEMPLATES_DIR).resolve()),
         "total": len(all_docs),
         "by_kind": {k: sorted(v) for k, v in by_kind.items()},
@@ -243,6 +269,9 @@ def inventory() -> dict:
         "errors": errs,
         "healthy": not errs,
     }
+    _inventory_cache["ts"] = now
+    _inventory_cache["data"] = out
+    return out
 
 
 if __name__ == "__main__":

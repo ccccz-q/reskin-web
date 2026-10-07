@@ -1,0 +1,122 @@
+# ═══════════════════════════════════════════════════════════
+# 换颜 Reskin · 自测 CI
+# ═══════════════════════════════════════════════════════════
+# 这个 workflow 存在的唯一理由：让「自测套件是绿的」这句话
+# 不再依赖「跑它的人本机恰好有 .env」。
+#
+# 为什么必须显式钉死 env（★ 关键，别删这段）：
+#   backend/tests/ 里好几个测试直接读环境变量决定走哪条通道。
+#   开发者机器上有 .env（真 key）→ 绿；开源用户 clone 下来没 .env → 整份红。
+#   这种「红灯与被测代码无关」的失败最消耗信任。
+#   参照 backend/tests/test_llm_resilience.py:39-47 的做法：
+#   key 填假值、base_url 指向 example.invalid（RFC 2606 保留域名，永不解析成功），
+#   于是「没有 key」这件事本身也被钉死，不再取决于跑测环境。
+#
+# 为什么 key 用 example.invalid 而不是 sk-test-dummy：
+#   域名写成保留段能保证即使哪天某个测试真的发了请求，也不可能打到真实服务。
+
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# 同一分支的新 push 取消仍在跑的旧任务，避免并发跑十几遍全量套件
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  self-test:
+    name: 自测套件（run_all.py）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    # ★ 没有 .env 也能跑通：所有配置都在这里自钉，不依赖仓库里的任何本机文件。
+    #   .env 本身是被 .gitignore 排除的，CI 上根本不存在这个文件。
+    env:
+      # ── 文本对话通道（DeepSeek / 火山方舟）──
+      DEEPSEEK_API_KEY: sk-ci-placeholder-not-a-real-key
+      DEEPSEEK_BASE_URL: https://example.invalid/v1
+      DEEPSEEK_MODEL: ci-placeholder-model
+
+      # ── 生图通道（Seedream）──
+      SEEDREAM_API_KEY: sk-ci-placeholder-not-a-real-key
+      SEEDREAM_BASE_URL: https://example.invalid/v1
+      SEEDREAM_MODEL: ci-placeholder-model
+
+      # ── 视觉通道（VLM，config.py:115-116 会回落到 DEEPSEEK_*）──
+      VISION_API_KEY: sk-ci-placeholder-not-a-real-key
+      VISION_BASE_URL: https://example.invalid/v1
+      VISION_MODEL: ci-placeholder-model
+
+      # ── 备用文本通道（test_llm_resilience.py 专测这条的 failover）──
+      PREMIUM_API_KEY: sk-ci-placeholder-not-a-real-key
+      PREMIUM_BASE_URL: https://example.invalid/v1
+      PREMIUM_MODEL: ci-placeholder-model
+
+      # ── 统一生图后端（config.py:148-150 会回落到 SEEDREAM_*）──
+      IMAGE_API_KEY: sk-ci-placeholder-not-a-real-key
+      IMAGE_BASE_URL: https://example.invalid/v1
+      IMAGE_MODEL: ci-placeholder-model
+      IMAGE_BACKEND: openai
+
+      # ── ★ 省钱总闸：CI 里绝对不许真的调生图。
+      #   run_all.py 自己也会设一份（见其第 55 行），这里再钉一道，
+      #   免得哪天 runner 逻辑调整就漏了。──
+      DISABLE_IMAGE_GENERATION: "1"
+
+      # ── 行为开关：钉成 CI 语义，避免依赖默认值随版本漂移 ──
+      PUBLIC_MODE: "0"
+      ADMIN_PANEL: "0"
+      LOCAL_TOKEN: ""
+      STORAGE_DIR: ""
+      IMAGE_STORAGE_DIR: ""
+      SQLITE_DIR: ""
+
+      # 让 Python 输出不缓冲，日志能实时进 Actions 面板
+      PYTHONIOENCODING: utf-8
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 装 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: 装依赖
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 跑自测套件
+        # ★ `shell: bash` 不是冗余：Actions 的**默认** shell 是 `bash -e`，
+        #   不带 pipefail。一旦写成 `python ... | tee log`，管道的退出码取自
+        #   tee（恒为 0），整套自测就变成「永远绿」—— 正是 run_all.py 末尾
+        #   注释里记下的那个历史 bug。显式声明 bash 才拿到 -eo pipefail。
+        #   （`set -o pipefail` 再写一遍是双保险，防有人后来把 shell 改回去。）
+        shell: bash
+        # run_all.py 自己用 __file__ 推导路径，cwd 用仓库根即可。
+        # 它只信子进程的 sys.exit(1) 退出码，不解析输出字符串。
+        run: |
+          set -o pipefail
+          python backend/tests/run_all.py 2>&1 | tee backend/tests/run_all.log
+
+      - name: 上传失败日志
+        # 只在失败时跑：run_all.py 的实时输出已经进了 Actions 日志，
+        # 这里补一份可下载的完整日志，方便本地复现。
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: self-test-log
+          path: backend/tests/run_all.log
+          if-no-files-found: ignore
+          retention-days: 7

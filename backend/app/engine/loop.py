@@ -37,6 +37,7 @@ from typing import Any, Callable
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import config                                                  # noqa: E402  （护栏常量统一从config 取）
 from config import MAX_AGENT_STEPS, MAX_TOOL_OBSERVATION_CHARS      # noqa: E402
 from contracts.tools import SPEND_TOOLS, TOOL_NAMES, openai_tools    # noqa: E402
 from infra.logging import audit, logger, step                        # noqa: E402
@@ -50,9 +51,62 @@ from tools.registry import ToolContext, dispatch, missing_implementations  # noq
 
 from .prompts import build_messages, build_system_prompt, compact_families_for_prompt  # noqa: E402
 
-HISTORY_LIMIT = 20          # 喂给模型的最大历史条数
-REPEAT_FUSE = 2             # 同一签名允许的最大重复次数（超过就熔断）
-MEMORY_TRIGGER = 12         # 消息数超过多少触发一次长期记忆更新
+# ★ 护栏常量统一从config 取（2026-10-06）——
+#   此前这三个数写死在这里，而 MAX_AGENT_STEPS 在 config 里 env 化，
+#   同一件事两套口径。现在全都能用 env 调，改护栏不必改代码。
+#   这里保留模块级别名：测试与既有调用直接读 loop.HISTORY_LIMIT。
+HISTORY_LIMIT = config.HISTORY_LIMIT          # 喂给模型的最大历史条数
+REPEAT_FUSE = config.REPEAT_FUSE              # 同一签名允许的最大重复次数（超过就熔断）
+MEMORY_TRIGGER = config.MEMORY_TRIGGER        # 消息数超过多少触发一次长期记忆更新
+
+
+def _est_tokens(text: str) -> int:
+    """保守估算一段文本的 token 数
+
+    ★ 为什么要有估算器（评审自查发现）：
+      `HISTORY_LIMIT` 只管「条数」，而 20 条长消息的 token 量可能顶得上
+      200 条短消息 —— 条数达标但 token 爆掉，上游会直接拒绝整轮请求，
+      用户看到的是「模型调用失败」。按条数裁剪不等于安全。
+
+    估法故意保守（宁可少留）：
+      CJK 与全角标点按 1 字≈1 token，其余按 4 字符≈1 token。
+      真实分词器对中文的压缩率通常在 1 字 1 token 上下，
+      这个估法会**高估** ASCII 文本 —— 方向对：宁可砍得狠一点。
+    """
+    if not text:
+        return 0
+    cjk = sum(1 for ch in text if "一" <= ch <= "鿿" or "　" <= ch <= "〿")
+    return cjk + (len(text) - cjk) // 4 + 1
+
+
+def _history_within_budget(thread_id: str, limit: int) -> list[dict]:
+    """取历史并按 token 预算二次裁剪（**在条数之后**）
+
+    裁剪从最旧的一条开始丢 —— 最近的消息对当前任务最有用。
+    永远至少保留最后一条，否则模型会拿到完全空白的对话。
+    """
+    rows = context_store.history_for_llm(thread_id=thread_id, limit=limit)
+    budget = config.CONTEXT_TOKEN_BUDGET
+    if budget <= 0 or not rows:
+        return rows
+    out: list[dict] = []
+    total = 0
+    # 反向遍历 = 从最新往回装，装不下就停 —— 天然实现「丢最旧的」
+    for row in reversed(rows):
+        # history_for_llm 的元素是「一组消息」(list[dict])，
+        # 但别把这个形状写死 —— 万一将来改成返回单条 dict，这里不该炸。
+        msgs = row if isinstance(row, list) else [row]
+        text = "".join(str((m or {}).get("content") or "") for m in msgs)
+        cost = _est_tokens(text)
+        if out and total + cost > budget:
+            break
+        out.append(row)
+        total += cost
+    out.reverse()
+    if len(out) < len(rows):
+        logger.info("上下文按token 预算裁剪：%d 条 → %d 条（约 %d token）",
+                    len(rows), len(out), total)
+    return out
 
 
 @dataclass
@@ -97,6 +151,26 @@ def _signature(name: str, args: dict) -> str:
         return name + "|" + json.dumps(args, ensure_ascii=False, sort_keys=True)
     except (TypeError, ValueError):
         return name + "|" + str(args)
+
+
+def _final_fallback_reply(ctx) -> str:
+    """收尾失败时给用户的话术 —— **按「手上有没有东西」分三种**
+
+    ★ 2026-06 评审自查发现：三处收尾里只有 forced_final 修过体验硬伤，
+      repeat_fuse 与 step_limit 仍写死「（模型调用失败）…」。但这几种情形的
+      用户处境完全不同：图已落盘时，用户手上就是成品，缺的只是一段说明文字 ——
+      告诉他「调用失败」会让他以为这趟白跑、甚至去重做一张。
+      所以按产物阶段分话术，而不是一句模板走天下。
+    """
+    arts = getattr(ctx, "artifacts", None) or {}
+    if arts.get("image_path") or arts.get("image_url"):
+        return ("图已经生成好了。刚才没能写出这段说明，你可以直接看图——"
+                "想换构图或配色的话，说一句就行。")
+    if arts.get("last_prompt"):
+        return ("提示词已经准备好了，只是没能接着往下走。说一句「继续」我就生成；"
+                "也可以换个说法，我把参数重新调一遍。")
+    return ("这一步没能走完。可以把刚才那句需求再说具体一点"
+            "（比如「主体不动、只换成水彩质感」），我重新试一次。")
 
 
 def run(
@@ -168,7 +242,7 @@ def run(
         #   后者是「如实呈现库里的内容」，前者额外做 tools 协议配对净化。
         #   直接喂 history 会在两种正常场景下构造出非法请求体（窗口截断 /
         #   上一轮提前中止），服务端一律 400 —— 见 context_store.history_for_llm。
-        history = context_store.history_for_llm(thread_id, limit=history_limit)
+        history = _history_within_budget(thread_id, history_limit)
 
         system_prompt = build_system_prompt(
             enabled_tools=enabled,
@@ -235,8 +309,7 @@ def run(
                 if forced_final:
                     logger.warning("收尾文案生成失败（图已生成，仅缺说明文字）：%s", e)
                     result.stopped_reason = "final_summary_failed"
-                    result.reply = "图已经生成好了。刚才没能写出这段说明，你可以直接看图——"\
-                                    "想换构图或配色的话，说一句就行。"
+                    result.reply = _final_fallback_reply(ctx)
                     audit("agent_final_summary_failed",
                           thread_id=thread_id, error=str(e)[:200])
                     break
@@ -390,12 +463,27 @@ def run(
                         "抱歉，这一步我没有得出可用的结论，换个说法或换张图再试试。"
                     )
                 except LLMError as e:
-                    result.reply = f"（模型调用失败）{e}"
+                    result.reply = _final_fallback_reply(ctx)
+                    logger.warning("熔断收尾文案生成失败：%s", e)
                 break
         else:
             # ── 步数耗尽：强制收尾
             result.stopped_reason = "step_limit"
             logger.warning("Agent 达到步数上限 %d，强制总结", MAX_AGENT_STEPS)
+            # ★ 与 repeat_fuse 分支对齐（2026-10-06 评审自查）：
+            #   下面这行是**防御性补齐，不是修 bug**。实测（探针：每步返回 2 个
+            #   工具调用、MAX_AGENT_STEPS=2）证明走到 step_limit 时协议必然完整——
+            #   因为设置 stop_reason 的两处（client_abort / repeat_fuse）都会
+            #   `break` 掉外层 for，else 分支根本到不了；能走到这里就说明每个
+            #   tool_call 都已附上 tool 回复。
+            #   那为什么还留着？① 两处收尾条件不同、代码却要各自保证同一件事，
+            #   对称地写一遍比"依赖上游路径恰好如此"更稳；② 将来若在工具循环里
+            #   加任何新的 break 分支，这里就是那个 bug 的护栏。
+            #   （评审自查报告里曾把这条写成"必然 400"的真缺陷，复核后不成立，
+            #     已按实测更正——保留代码，更正说法。）
+            filled = _fill_missing_tool_replies(messages)
+            if filled:
+                logger.info("步数耗尽收尾：补了 %d 条未执行的工具回复", filled)
             messages.append({
                 "role": "user",
                 "content": "（系统提示）已达最大步数，请直接用中文给出简短结论，不要再调用工具。",
@@ -407,7 +495,8 @@ def run(
                     "这一步走了太久，还没得出结果。可以更具体地说说你想要什么效果。"
                 )
             except LLMError as e:
-                result.reply = f"（模型调用失败）{e}"
+                result.reply = _final_fallback_reply(ctx)
+                logger.warning("步数耗尽收尾文案生成失败：%s", e)
 
         result.artifacts = dict(ctx.artifacts)
         emit("finish", stopped_reason=result.stopped_reason, steps=result.steps)

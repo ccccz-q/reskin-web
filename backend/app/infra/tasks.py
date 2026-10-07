@@ -135,6 +135,8 @@ _TASKS: dict[str, Task] = {}
 _LOCK = threading.RLock()
 _SWEEPER_STARTED = False
 _SWEEP_INTERVAL_SEC = 20
+# ★ 2026-10-06：清扫线程的停止信号（见 _sweeper / shutdown_sweeper）
+_SWEEP_STOP = threading.Event()
 
 
 def _emit(task: Task, event: str, data: Any) -> None:
@@ -179,9 +181,23 @@ def _emit(task: Task, event: str, data: Any) -> None:
 
 
 def _sweeper() -> None:
-    """清扫：① 总时限超时的任务 ② TTL 到期的已完成任务"""
-    while True:
-        time.sleep(_SWEEP_INTERVAL_SEC)
+    """清扫：① 总时限超时的任务 ② TTL 到期的已完成任务
+
+    ★ 2026-10-06：改成可退出的。此前是 `while True: time.sleep(...)`，
+      没有停止路径 —— 应用关闭 / 测试反复起进程时线程就一直在那儿醒着，
+      既是资源泄漏，也让"这个进程到底还剩什么"变得不可知。
+      现在用 `_SWEEP_STOP` 事件退出，`shutdown_sweeper()` 供 lifespan 调用。
+
+    ★ 这里**故意不退还额度**：清扫器手里没有票据（预扣发生在 tools/registry 的
+      护栏里，它属于正在跑的那个工作线程）。它只做一件事 —— `t.cancel.set()`，
+      工作线程在下一个探针点退栈时会经过护栏的 `finally`，归还自动发生。
+      进程被硬杀时走另一条兜底：启动时 `reconcile_reservations()` 按 TTL 回收。
+      **职责分散在两处、但都有落点**，比让清扫器去猜"该退谁的账"更可靠。
+    """
+    while not _SWEEP_STOP.is_set():
+        # 用 wait 而不是 sleep：既能周期清扫，也能被立刻唤醒退出
+        if _SWEEP_STOP.wait(_SWEEP_INTERVAL_SEC):
+            return
         now = time.time()
         try:
             with _LOCK:
@@ -217,8 +233,37 @@ def _ensure_sweeper() -> None:
     with _LOCK:
         if _SWEEPER_STARTED:
             return
+        _SWEEP_STOP.clear()
         threading.Thread(target=_sweeper, daemon=True, name="task-sweeper").start()
         _SWEEPER_STARTED = True
+
+
+def shutdown_sweeper(timeout: float = 2.0) -> bool:
+    """停掉清扫线程（应用关闭 / 测试收尾用）
+
+    返回是否真的停掉了。幂等 —— 没启动过也返回 True。
+    """
+    global _SWEEPER_STARTED
+    _SWEEP_STOP.set()
+    with _LOCK:
+        started = _SWEEPER_STARTED
+        _SWEEPER_STARTED = False
+    if not started:
+        return True
+    # daemon=True 的线程不会挡住进程退出，所以这里只给一个短宽限期：
+    # 目标是"让它别再醒着"，不是"保证它一定停"（sleep 已被事件替换，通常立刻返回）
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _sweeper_alive():
+            return True
+        time.sleep(0.05)
+    logger.warning("清扫线程未在 %.1fs 内退出（不影响进程退出，它是daemon）", timeout)
+    return False
+
+
+def _sweeper_alive() -> bool:
+    return any(t.name == "task-sweeper" and t.is_alive()
+               for t in threading.enumerate())
 
 
 # ══════════════════ 对外 API ══════════════════

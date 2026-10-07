@@ -17,10 +17,20 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+# ★ 本模块是**最底层**（infra.logging 反过来 import 它拿 STORAGE_DIR），
+#   所以这里不能用 infra.logging 的 logger —— 那样会形成循环导入，
+#   表现为「导入 config 直接 RecursionError / AttributeError」。
+#   这一条曾以"忘了导入 logger"的形态存在：:185 处调用 logger.error(...)，
+#   而全文没有任何 logger 定义 —— 只要 ADMIN_PANEL=1 且口令不足 8 位，
+#   导入本模块就抛 NameError，**安全闸门自己把进程干掉了**（已实测复现）。
+#   教训：安全闸门必须"永远能跑完"，否则它拦不住任何东西，只会制造事故。
+_boot_logger = logging.getLogger("travelnote.config")
 
 # ── 路径基准 ────────────────────────────────────────────────
 # .../项目/backend/app/config.py
@@ -116,7 +126,7 @@ PREMIUM_BASE_URL = (os.getenv("PREMIUM_BASE_URL") or "").strip() or DEEPSEEK_BAS
 PREMIUM_MODEL = (os.getenv("PREMIUM_MODEL") or "").strip() or DEEPSEEK_MODEL
 
 # ── 图像生成通道 ──
-# IMAGE_BACKEND=openai → 任何 OpenAI 兼容的图像接口（images/generations + images/edits）
+# IMAGE_BACKEND=openai → xbcl.link 的 gpt-image-2（images/generations + images/edits，返回 b64_json）
 # IMAGE_BACKEND=ark    → 火山方舟 Seedream（旧通道，返回 url；保留作备胎）
 IMAGE_BACKEND = (os.getenv("IMAGE_BACKEND") or "openai").strip().lower()
 if IMAGE_BACKEND not in ("openai", "ark"):
@@ -164,12 +174,28 @@ CORS_ALLOW_CREDENTIALS = False
 # 要把后端暴露到局域网 / 内网演示时才需要它。
 LOCAL_TOKEN = (os.getenv("LOCAL_TOKEN") or "").strip()
 
-# ── 管理员面板：本开源版**不含**任何管理入口 ──────────────────
-# 原项目有站点所有者专属的管理面板（口令 + TOTP 动态码 + 回收站 + 全站图片管理）。
-# 开源版把这整块**代码层面移除**了（路由、服务模块、管理页、配置项一并摘除）：
-#   · 管理入口属于"站点所有者"的私有运维面，不该随代码分发给每一个安装者；
-#   · 留着配置项就等于留了一个"看起来能开"的假入口，早晚有人会不小心填上口令开起来。
-# 如果你 fork 后想加自己的管理面，请自行实现并**默认关闭**（配置为空即不可用）。
+# ── 管理员面板（2026-10-05）────────────────────────────────────
+# ★ 为什么单独一套身份，而不复用 X-Session-Id：
+#   用户会话是**任何人**都能自己生成的一串 UUID。若管理员凭证也走同一套，
+#   等于「任何访客都能给自己签发管理员身份」—— 那这面板就是个摆设，
+#   而且它还能看所有人的图、删任何人的图，后果比泄露隐私更糟。
+#   所以：管理员口令 → 换一枚**带 scope 的短期签名令牌**，与用户会话彻底无关。
+ADMIN_PANEL = (os.getenv("ADMIN_PANEL") or "").strip() in ("1", "true", "yes", "on")
+ADMIN_PASSWORD = (os.getenv("ADMIN_PASSWORD") or "").strip()
+# TOTP 共享密钥（可选但强烈建议）：只填口令的话，端口一旦暴露就等于开放管理入口。
+ADMIN_TOTP_SECRET = (os.getenv("ADMIN_TOTP_SECRET") or "").strip()
+ADMIN_TOKEN_TTL_SEC = int(os.getenv("ADMIN_TOKEN_TTL_SEC", "7200"))      # 登录令牌 2 小时
+ADMIN_TICKET_TTL_SEC = int(os.getenv("ADMIN_TICKET_TTL_SEC", "60"))    # 下载票据 60 秒
+ADMIN_TRASH_DAYS = int(os.getenv("ADMIN_TRASH_DAYS", "7"))             # 回收站保留天数
+
+# 安全闸门：口令为空时**绝不**允许进入面板（避免"配了一半 = 全开放"）。
+# 也不提供任何"默认口令"——那是最容易被人猜到的洞。
+ADMIN_READY = bool(ADMIN_PASSWORD) and len(ADMIN_PASSWORD) >= 8
+if ADMIN_PANEL and not ADMIN_READY:
+    _boot_logger.error(
+        "ADMIN_PANEL=1 但 ADMIN_PASSWORD 未设置或少于 8 位 —— 管理员面板将保持关闭。"
+        "这是刻意的：宁可没有面板，也不要一个能被猜到的面板。")
+    ADMIN_PANEL = False
 
 # ── 治理：上传与调用的护栏 ───────────────────────────────────
 # 旧版 await file.read() 毫无限制，一个 2GB 文件就能把进程内存打满
@@ -208,6 +234,20 @@ LLM_FALLBACK_DOWNGRADE = os.getenv(
 # Agent 循环护栏：防止 LLM 死循环烧钱
 MAX_AGENT_STEPS = int(os.getenv("MAX_AGENT_STEPS", "8"))
 MAX_TOOL_OBSERVATION_CHARS = int(os.getenv("MAX_TOOL_OBSERVATION_CHARS", "2000"))
+# ★ 2026-10-06：把剩下三个护栏常量也收进 config。此前它们硬编码在
+#   engine/loop.py 顶部，而 MAX_AGENT_STEPS 却在 config 里 env 化 ——
+#   同一个文件里两套口径，调参的人会以为「改 env 就能调所有护栏」，
+#   结果改错地方只能改代码。**口径不一致本身就是一种缺陷。**
+HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "20"))          # 喂模型的最大历史条数
+REPEAT_FUSE = int(os.getenv("REPEAT_FUSE", "2"))# 同一签名允许的最大重复次数，超过即熔断
+MEMORY_TRIGGER = int(os.getenv("MEMORY_TRIGGER", "12"))        # 消息数超过多少触发长期记忆
+# ★ 上下文 token 预算（按条数裁剪的补充，不是替代）：
+#   HISTORY_LIMIT 管「条数」，但20 条长消息的 token 量可能顶得上 200 条短消息。
+#   两道闸一起上：先按条数砍到 HISTORY_LIMIT，再按估算 token 砍到本预算。
+#   估算是保守的字符法（中文按 1 字≈1 token，其它按 4 字符≈1 token），
+#   宁可少留也不要超 —— 超了会被上游直接拒绝，整轮报废。
+CONTEXT_TOKEN_BUDGET = int(os.getenv("CONTEXT_TOKEN_BUDGET", "12000"))
+TOOL_RESULT_CLIP_CHARS = int(os.getenv("TOOL_RESULT_CLIP_CHARS", "1200"))
 
 # ── 后台任务护栏（infra/tasks.py）──────────────────────────
 #
