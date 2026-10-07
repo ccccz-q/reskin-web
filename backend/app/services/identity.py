@@ -350,7 +350,8 @@ def bind_account(session_id: str, username: str,
     """把当前会话绑定到新账号。成功返回 (True, '')，失败返回 (False, 原因)。"""
     name = (username or "").strip()
     if not username_ok(name):
-        return False, "用户名需要 3–20 位字母、数字、下划线或中文"
+        # 2 位起：中文用户名里"小旅"这类两字称呼是自然的（正则也是 {2,20}）
+        return False, "用户名需要 2–20 位字母、数字、下划线或中文"
     if len(password or "") < 6:
         return False, "密码至少 6 位"
     _ensure_tables()

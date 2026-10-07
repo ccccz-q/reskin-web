@@ -54,6 +54,10 @@ from governance.guard import policy_snapshot, reconcile_reservations  # noqa: E4
 from infra.logging import logger, recent_audit                   # noqa: E402
 from infra.security import LocalAccessMiddleware, security_snapshot  # noqa: E402
 from infra.worker_guard import check_multiworker                   # noqa: E402
+# ── 管理后台（routers/admin.py 等三个文件）只在私库存在 ──────────
+#   开源版给比赛评审看，不含任何管理入口，那三个文件整块不派生。
+#   下面这行 import 同步时会被 tools/sync_oss.py 剥掉：
+#   带过去就会 ModuleNotFoundError，连累后面所有测试（2026-10-07 事故）。
 from routers.auth import router as auth_router                     # noqa: E402
 from routers.chat import router as chat_router                   # noqa: E402
 from routers.forge import router as forge_router                 # noqa: E402
@@ -273,7 +277,7 @@ async def unhandled(request: Request, exc: Exception):
 
 # ─────────────── 路由 ───────────────
 app.include_router(auth_router)          # 身份：访客码 / 绑定账号 / 登录
-# ★ 开源版不含管理面板（routers/admin.py 整块不在本仓库）
+# 管理面板整块不派生（理由见文件上方的 import 处），这行同步时剥掉。
 app.include_router(image_router)
 app.include_router(templates_router)
 app.include_router(chat_router)

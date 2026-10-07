@@ -68,16 +68,31 @@ _SPEC_DIR = _find_spec_dir()
 _RUNTIME_DIR = Path(TEMPLATES_DIR) / "families"
 
 
-def _resolve_images(urls: list[str]) -> list[str]:
+def _resolve_images(urls: list[str], sid: str = "") -> list[str]:
     """URL → 本地绝对路径。非法的一律跳过（不让用户输入带偏整条链）
 
-    ★ 2026-10-06：跳过本身是对的（normalize_reference 抛的是 AgentInputError，
-      属用户输入问题，不该让整条链崩），但**静默**跳过不行 ——
-      用户贴 5 张、其中 3 张路径非法，他只会觉得「怎么提炼质量这么差」，
-      而永远不知道有 3 张根本没进来。这里补日志，至少可追溯。
+    ★★ 越权修复（2026-10-07 独立审查 S1，实测复现）
+    --------------------------------------------------
+    原来这里只调`normalize_reference()` —— 它只做**目录白名单**防路径穿越，
+    **不判断这张图属于谁**。于是：
+        攻击者拿到别人的图 URL → 传给 /api/forge/draft-async
+        →  victim's 图片被读走、喂进 VLM 做解构，文件名还会存进 forge 记录
+    对比：`routers/image.py` 里 `may_read` 出现 5 次（列表/取图/缩略图/打包/诊断），
+    forge 是**唯一漏网的那道门**。这类"一边严一边松"最危险——
+    评审看到image.py 的纪律会以为全项目都这样。
+
+    现在与 image.py 走**同一个** `may_read` 判定（services/image_access.py），
+    口径一致：自己的图 + `_seed/` 公共展示图能读，别人的图跳过。
+    ★ 跳过时**记日志**，因为用户贴 5 张有 3 张不可用，他只会觉得
+      「怎么提炼质量这么差」，而永远不知道有 3 张根本没进来。
+      （2026-10-06 起：normalize_reference 抛的是 AgentInputError，
+        属用户输入问题，不该让整条链崩，但**静默**跳过不行。）
     """
+    from services.image_access import may_read
+
     out = []
     skipped = 0
+    denied = 0
     for u in urls or []:
         try:
             p = normalize_reference(u)
@@ -85,11 +100,19 @@ def _resolve_images(urls: list[str]) -> list[str]:
             skipped += 1
             logger.warning("参考图被跳过（非法地址 %r）：%s", str(u)[:80], e)
             continue
-        if p and os.path.exists(p):
-            out.append(p)
-        else:
+        if p and not os.path.exists(p):
             skipped += 1
             logger.warning("参考图被跳过（文件不存在 %r）", str(u)[:80])
+            continue
+        # ★ 归属校验：路径合法 ≠ 这张图是你的
+        if p and not may_read(p, sid):
+            denied += 1
+            logger.warning("参考图被跳过（不属于当前会话 %r）", str(u)[:80])
+            continue
+        if p:
+            out.append(p)
+    if denied:
+        skipped += denied
     if skipped:
         logger.info("参考图 %d/%d 张不可用，本次提炼基于 %d 张进行",
                     skipped, len(urls or []), len(out))
@@ -173,12 +196,12 @@ def _resolve_base(base_family_id: str) -> tuple[dict | None, str]:
 
 def _forge_and_save(req: DraftRequest, progress=None,
                     cancelled: "callable | None" = None,
-                    owner: str = "") -> dict:
+                    owner: str = "", sid: str = "") -> dict:
     """同步执行一次提炼并入库。draft 端点与后台任务共用；永不抛 HTTP 异常。
     cancelled：中止探测函数 —— 透传给提炼器，在阶段之间检查，命中即终止。
     owner：属主会话（公开版）；空=本地 default 模式，不写属主。
     """
-    paths = _resolve_images(req.image_urls)
+    paths = _resolve_images(req.image_urls, sid)
     base, base_warn = _resolve_base(req.base_family_id)
 
     if not paths and not req.theory.strip():
@@ -290,7 +313,10 @@ def _run_forge_task(task_id: str, req: DraftRequest):
 
         res = _forge_and_save(req, progress=_progress,
                               cancelled=t.get("cancel").is_set if t.get("cancel") else None,
-                              owner=t.get("owner") or "")
+                              owner=t.get("owner") or "",
+                              # ★ 归属校验要用的就是"发起任务时"那个会话，
+                              #   不能在worker 里重新解析（那时已无请求上下文）
+                              sid=t.get("sid") or "")
         with _TASKS_LOCK:
             t["result"] = {
                 "ok": bool(res.get("ok")),
@@ -334,7 +360,7 @@ async def create_draft(req: DraftRequest, sid: str = Depends(session_dep)):
 
 @router.post("/draft-async", summary="后台提炼：立即返回任务 id，提炼在线程里继续")
 async def create_draft_async(req: DraftRequest, sid: str = Depends(session_dep)):
-    paths = _resolve_images(req.image_urls)
+    paths = _resolve_images(req.image_urls, sid)
     if not paths and not req.theory.strip():
         raise HTTPException(422, {"code": "forge_no_input",
                                   "message": "至少上传一张参考图（推荐同类型 3–6 张）；风格理论可选。"})
@@ -348,6 +374,9 @@ async def create_draft_async(req: DraftRequest, sid: str = Depends(session_dep))
         task_id = "ftask_" + uuid.uuid4().hex[:12]
         _TASKS[task_id] = {
             "task_id": task_id, "status": "running", "phase": "排队中",
+            # ★ 发起者的会话：worker 里要拿它做参考图归属校验，
+            #   那里已经没有请求上下文了，只能在这里存下来传下去
+            "sid": sid,
             "name": req.name or "", "images": [os.path.basename(p) for p in paths],
             "started_at": now, "finished_at": None,
             "result": None, "error": None,
@@ -414,9 +443,9 @@ async def revise_draft(req: ReviseRequest, sid: str = Depends(session_dep)):
     # ★ 参考图选择：用户本轮贴了新图（如理想效果图）→ 用新图并启用 VLM 视觉
     #   识别（理想图的布局/配色/界面规格会被提取进证据）；没贴 → 沿用当初
     #   提炼时的参考图，行为与旧版一致。
-    new_paths = _resolve_images(req.image_urls) if req.image_urls else []
+    new_paths = _resolve_images(req.image_urls, sid) if req.image_urls else []
     use_new = bool(new_paths)
-    paths = new_paths if use_new else _resolve_images(row.get("images") or [])
+    paths = new_paths if use_new else _resolve_images(row.get("images") or [], sid)
     use_vlm = use_new                # 新图才值得花一次视觉识别
 
     from fastapi.concurrency import run_in_threadpool

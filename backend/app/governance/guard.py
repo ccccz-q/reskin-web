@@ -38,6 +38,7 @@ from config import (                                             # noqa: E402
 from infra.counters import (                                           # noqa: E402
     add_reservation,
     bump_counter,
+    try_increment_capped,
     consume_reservation,
     get_counter,
     list_reservations,
@@ -160,17 +161,24 @@ def reserve_generation(thread_id: str, *, reference_image: str | None = None) ->
         assert_safe_image(reference_image)
 
     key = _gen_key(thread_id)
+    # ★★ 判断与扣减合并成**一条 SQL**（2026-10-07 M1）
+    #   旧写法是「读 → 判断 → 加」三步 + threading.Lock。单进程内够用，
+    #   但 threading.Lock **只在进程内有效** —— 部署成多 worker 时四个进程
+    #   互相看不见对方的扣减，实测 4 进程预扣 12 次（上限 10）→ **超卖**。
+    #   配额是保护 API 花费的闸，失效就是真金白银的损失。
+    #   现在交给数据库做条件更新（try_increment_capped → rowcount 判定），
+    #   SQLite 保证单条 UPDATE 原子，**天然跨进程**。
+    #   进程内的 _reserve_lock 仍然保留：它还负责把「占位 + 票据写入」串成一块，
+    #   避免票据写失败时额度已经被扣（下面仍有回滚）。
     with _reserve_lock:
-        used = get_counter(key)
-        # 不限额度（<=0）时只记数、不拦截
-        if MAX_GENERATIONS_PER_SESSION > 0 and used >= MAX_GENERATIONS_PER_SESSION:
+        got, used = try_increment_capped(key, MAX_GENERATIONS_PER_SESSION)
+        if not got:
             raise GovernanceError(
                 f"本会话已用完 {MAX_GENERATIONS_PER_SESSION} 张生成额度"
                 f"（治理项 MAX_GENERATIONS_PER_SESSION）。",
                 code="quota_exhausted",
                 **remaining_quota(thread_id),
             )
-        bump_counter(key, 1)
         token = uuid.uuid4().hex[:16]
         try:
             add_reservation(token, thread_id)

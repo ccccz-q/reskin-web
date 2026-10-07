@@ -15,6 +15,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+import ast as _ast
+import inspect as _inspect
+
 # 让本文件既能被 pytest 收集，也能 python xxx.py 直接运行：
 # 把 backend/app 加进 import root（与 uvicorn main:app 的约定一致）
 _root = Path(__file__).resolve().parents[1] / "app"
@@ -421,6 +424,69 @@ _src = (_root / "engine" / "loop.py").read_text(encoding="utf-8")
 check("loop.py 里不再硬编码这三个数字",
       "HISTORY_LIMIT = 20" not in _src and "REPEAT_FUSE = 2" not in _src
       and "MEMORY_TRIGGER = 12" not in _src)
+
+print()
+print("=== 18. run() 拆分后：额度键透传与护栏位置 ===")
+# ★ 这组断言专治「重构把2026-10-07 的额度绕过修复弄丢了」：
+#   ToolContext 的构造参数顺序与 quota_key 透传是那天的修复，
+#   拆函数时最容易"顺手整理"掉。
+_run_src = _inspect.getsource(loop.run)
+_prep_src = _inspect.getsource(loop._prepare)
+
+check("★ quota_key 一路透传到 ToolContext",
+      "quota_key=quota_key or \"\"" in _prep_src, "")
+from tools.registry import ToolContext as _TC            # noqa: E402
+
+_tc_sig = list(_inspect.signature(_TC).parameters)
+check("★ ToolContext 仍以 kwonly 形式接收 quota_key（不是位置参数）",
+      _tc_sig[0] != "quota_key", f"首参={_tc_sig[0]}")
+
+# 真的构造一次，确认 quota_key 落到实例上（不靠读源码猜）
+_probe_ctx = _TC(thread_id="t18", quota_key="user-42")
+check("★ ToolContext 实例上确实带着 quota_key",
+      getattr(_probe_ctx, "quota_key", "") == "user-42",
+      str(getattr(_probe_ctx, "quota_key", "<无该属性>")))
+
+# 五条护栏的判定点必须还在 run() / _execute_tools 里，不能被阶段拆分稀释
+check("步数上限仍由 run() 的循环范围决定",
+      "range(1, MAX_AGENT_STEPS + 1)" in _run_src, "")
+check("★ 观察长度截断仍接在 _execute_tools 的每个 tool 回复上",
+      "_clip_observation(obs, MAX_TOOL_OBSERVATION_CHARS)" in _inspect.getsource(loop._execute_tools), "")
+check("★ 重复熔断阈值仍接在工具执行里",
+      "REPEAT_FUSE" in _inspect.getsource(loop._execute_tools), "")
+check("★ 断连检查仍在每步之前 + 工具之间（两处都在）",
+      "ctx.aborted()" in _run_src
+      and "ctx.aborted()" in _inspect.getsource(loop._execute_tools), "")
+
+# 阶段函数是模块级 + 只吃 LoopCtx
+_run_tree = _ast.parse(_run_src)
+_run_fn = next(f for f in _run_tree.body
+               if isinstance(f, _ast.FunctionDef) and f.name == "run")
+# ast.walk 会把节点自己也算进去，所以要排除 run 本身，剩下的才是真嵌套闭包
+_inner18 = [n.name for n in _ast.walk(_run_fn)
+            if isinstance(n, _ast.FunctionDef) and n is not _run_fn]
+check("run() 里没有嵌套闭包（emit/aborted 已变成 LoopCtx 方法）",
+      _inner18 == [], str(_inner18))
+for _n18 in ("_prepare", "_call_model", "_record_assistant", "_execute_tools", "_finish"):
+    check(f"阶段 {_n18}() 在模块级且以 LoopCtx 为第一参数",
+          hasattr(loop, _n18)
+          and list(_inspect.signature(getattr(loop, _n18)).parameters)[0] == "ctx",
+          "")
+check("★ LoopCtx 持有 emit/aborted（不再靠闭包捕获 on_event/should_abort）",
+      hasattr(loop.LoopCtx, "emit") and hasattr(loop.LoopCtx, "aborted"), "")
+
+# 事件回调抛异常不能拖垮 Agent（emit 的旧语义）
+_lc = loop.LoopCtx(result=loop.AgentRunResult(), thread_id="t18",
+                   on_event=lambda e, p: 1 / 0)
+try:
+    _lc.emit("token", text="x")
+    check("★ 事件回调抛异常被吞掉（语义与旧闭包一致）", True)
+except Exception as e:# noqa: BLE001
+    check("★ 事件回调抛异常被吞掉（语义与旧闭包一致）", False, repr(e))
+_lc2 = loop.LoopCtx(result=loop.AgentRunResult(), thread_id="t18",
+                    should_abort=lambda: 1 / 0)
+check("★ 取消探针抛异常 → 当没取消（语义与旧闭包一致）",
+      _lc2.aborted() is False, "")
 
 print()
 print(f"结果：{PASS} 通过 / {FAIL} 失败")

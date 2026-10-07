@@ -744,6 +744,19 @@ from services.forge_spec_guard import (                             # noqa: E402
     _protect_positive_requirements,
     _resolve_unknown_slots,
 )
+# ★ god module 拆分第六刀：forge() 的七个流程阶段搬到 services/forge_stages.py。
+#   依赖方向与 forge_spec_guard 相反 —— **本模块加载期** import forge_stages，
+#   所以 forge_stages 绝不能加载期 import 本模块（它靠函数内延迟 import 避环）。
+from services.forge_stages import (                                # noqa: E402
+    DECODE_SHARE,
+    ForgeCtx,
+    stage_card,
+    stage_compile,
+    stage_evidence,
+    stage_finish,
+    stage_intent,
+    stage_qc_repair,
+)
 
 
 _CANCELLED = {"ok": False, "cancelled": True, "error": "已按你的要求中止"}
@@ -761,63 +774,35 @@ def forge(
 ) -> dict:
     """主入口：多图（+可选理论 +可选风格提示词）→ 视觉卡 → 家族模板
 
-    progress：可选回调 progress(阶段文案)，供后台任务向 UI 报告进度；
-    回调自身的异常一律吞掉（进度上报绝不能弄死提炼）。
-    style_prompt：用户收集的生图提示词整包（正/负向词）—— 第三输入源，
-    在解构与编译两个阶段都会注入。
-    cancelled：可选的中止探测函数（如 threading.Event().is_set）—— 在每个
-    耗时阶段之间检查，命中即返回 {"ok": False, "cancelled": True}；正在
-    进行中的那一次模型调用无法被硬中断，但绝不会开始下一次。永不抛业务异常。
+    progress：可选回调 progress(阶段文案)，供后台任务向 UI 报告进度；回调自身的
+      异常一律吞掉（进度上报绝不能弄死提炼）。style_prompt：用户收集的生图提示词
+      整包（正/负向词）—— 第三输入源，在解构与编译两个阶段都会注入。
+    cancelled：可选的中止探测函数（如 threading.Event().is_set）—— 在每个耗时
+      阶段之间检查，命中即返回 {"ok": False, "cancelled": True}；正在进行中的那一次
+      模型调用无法被硬中断，但绝不会开始下一次。永不抛业务异常。
+
+    ★ 本函数现在只做**编排**：证据 / 视觉卡 / 意图 / 编译 / QC 自修 / 收尾六个阶段
+      都在 `services.forge_stages`，共享状态（墙钟 deadline、阶段配额、中止探针、
+      进度回调）挂在 `ForgeCtx` 上。逐图解构的并行展开仍留在这里——它是唯一直接
+      决定"每张图分到多少预算"的地方，放在编排层看得见。
     """
-
-    def _budget_left() -> float:
-        """整条链路还剩多少秒（inf = 不设硬闸）"""
-        if _deadline is None:
-            return float("inf")
-        return max(0.0, _deadline - time.time())
-
-    #★ 阶段配额：解构最多只能吃掉总预算的一部分，**剩下的必须留给编译**。
-    #   为什么（2026-10-07 端到端实测）：上游慢的时候，解构会把 360s 里的
-    #   大头花光，等编译开始时 `_budget_left()` 已经很��，
-    #   编译被硬闸掐掉→ 用户等了 3 分半，**什么都没拿到**。
-    #   而编译是**唯一不可降级**的阶段（没有它就没有草稿），
-    #   所以它必须**预留**额度，而不是和其他阶段先到先得。
-    _DECODE_SHARE = 0.55        # 解构最多用掉 55%，至少留 45% 给编译
-
-    def _decode_budget() -> float:
-        """解构这一轮允许花多少（含重试）"""
-        left = _budget_left()
-        if left == float("inf"):
-            return float(FORGE_VLM_TIMEOUT_SEC)
-        return max(30.0, min(FORGE_VLM_TIMEOUT_SEC, left * _DECODE_SHARE))
-
-    def _report(msg: str):
-        if progress:
-            try:
-                progress(msg)
-            except Exception:
-                pass
+    # ★ 三道预算闸的**唯一**状态源（阶段函数靠它拿到同一份 deadline，见 forge_stages 头注）
+    ctx = ForgeCtx(cancelled=cancelled, progress=progress)
+    _DECODE_SHARE = DECODE_SHARE      # 阶段配额：解构最多用掉 55%，至少留 45% 给编译
+    _budget_hit = False
+    _report = ctx.report
 
     def _stop() -> bool:
-        try:
-            if cancelled and cancelled():
-                return True
-        except Exception:
-            pass
-        # ★ 整条链路硬闸（2026-10-07）：到点就当"中止"处理。
-        #   为什么接在 _stop() 而不是各阶段各判一次：_stop() 是全流程**唯一**
-        #   的中止探针（解构前后、合成前、编译前、自修轮都会问），
-        #   接在这里 = 一处改动覆盖所有阶段，不会漏。
-        if _deadline is not None and time.time() > _deadline:
-            _budget_hit = True
-            logger.warning("提炼超过总预算 %.0fs，提前收尾（已产出的草稿会保留）",
-                           FORGE_TOTAL_BUDGET_SEC)
-            return True
-        return False
+        """全流程唯一中止探针（解构后/合成后/编译前/自修轮都会问）
 
-    # 预算闸在started 赋值后再计算，所以先声明
-    _deadline: float | None = None
-    _budget_hit = False
+        判据全在 `ctx.stop()` 里；这里只把"是不是预算到点"同步到局部量。
+        """
+        nonlocal _budget_hit
+        hit = ctx.stop()
+        _budget_hit = ctx.budget_hit
+        return hit
+
+    _decode_budget = ctx.decode_budget  # 每张图分到的墙钟额度（含重试）
 
     paths = [p for p in (image_paths or []) if p and os.path.exists(p)]
     if not paths and not (theory or "").strip() and not (style_prompt or "").strip():
@@ -825,16 +810,15 @@ def forge(
     if _stop():
         return dict(_CANCELLED)
 
+    # ★ 墙钟硬闸的起点：整条链路**只在这里**定一次，之后所有阶段问的都是同一份 deadline
     started = time.time()
-    if FORGE_TOTAL_BUDGET_SEC > 0:
-        _deadline = started + FORGE_TOTAL_BUDGET_SEC
+    _deadline = started + FORGE_TOTAL_BUDGET_SEC if FORGE_TOTAL_BUDGET_SEC > 0 else None
+    ctx.arm(started, _deadline)
 
-    # ★ 证据一律走本地客观测量（色板/明度/朝向，便宜且真实）。
-    #   看图只发生在下面的解构阶段 —— 之前两张阶段各看一次，配了视觉模型后等于每张图看两遍。
-    _report(f"分析 {len(paths)} 张参考图")
-    evidence, warnings = _reference_evidence(paths, False)
+    # ① 证据：本地客观测量（色板/明度/朝向，便宜且真实），看图只发生在解构阶段
+    evidence, warnings = stage_evidence(ctx, paths)
 
-    # ① 解构（并行 —— 等模型返回是 IO 密集，串行会让 6 张图变成好几分钟）
+    # ② 逐图解构（并行 —— 等模型返回是 IO 密集，串行会让 6 张图变成好几分钟）
     roles = _assign_roles(paths) if paths else []
     role_by_i = {int(r.get("i", -1)): r for r in roles if isinstance(r, dict)}
     targets = list(enumerate(paths[:MAX_IMAGES]))
@@ -852,8 +836,8 @@ def forge(
                         it[1], role_by_i.get(it[0]),
                         ev_by_file.get(os.path.basename(it[1]), {}), use_vlm,
                         style_prompt, cancelled=cancelled,
-                        # ★ 阶段配额（见 forge 里的 _DECODE_SHARE 注释）：
-                        #   解构最多吃掉总预算的一部分，保证编译有额度。
+                        # ★ 阶段配额：按图取（不是一次算完发给所有图）——
+                        #   排到后面的图拿到的必须是它**自己起跑时**的剩余额度。
                         wall_budget=_decode_budget()),
                     targets))
         decodes = results
@@ -861,171 +845,35 @@ def forge(
     if _stop():
         return dict(_CANCELLED)
 
-    # ② 合成视觉卡（纯代码合并 + 跨图共识投票，不调模型）
-    #   ★ 编译合并（2026-10-04）：原「≥3 图时再加一次 LLM 跨图共识」已砍——
-    #   _synthesize 的 shared_grammar 频次投票本来就是默认共识路径，LLM 版
-    #   只是锦上添花却是全链路唯一可省的调用（编译合并后 6 图省 1 次调用
-    #   + 15–60s 墙钟）。共识表述的连贯性由编译端五段式重组弥补。
-    _report("合成视觉卡")
-    card = _synthesize(decodes, theory, evidence) if (decodes or (theory or "").strip()) else {}
+    # ③ 合成视觉卡（纯代码合并 + 跨图共识投票，不调模型）
+    card = stage_card(ctx, decodes, theory, evidence)
     if _stop():
         return dict(_CANCELLED)
 
-    # ③ 编译家族（intent 三源合一：风格理论 + 用户提示词 + 补充说明）
+    # ④ 意图三源合一：风格理论 + 用户提示词 + 补充说明
     intent = " ".join(x for x in [(theory or "").strip(), (style_prompt or "").strip(),
                                   (user_notes or "").strip()] if x)
     if _stop():
         return dict(_CANCELLED)
 
-    # ③' 轻量意图解析（并行两连）：世界观参照 + 正向要求（要求出现/要求去掉）。
-    #   都是低温度小调用，失败各自静默降级为空 —— 不阻塞主链。
-    _report("识别用户意图")
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        fw = pool.submit(_detect_world, intent)
-        fp = pool.submit(_parse_positive_requirements, style_prompt, user_notes)
-        world = fw.result()
-        preq = fp.result()
-    if world:
-        _report(f"按「{world['world_name']}」世界观编译")
-    intent_calls = (1 if world else 0) + (1 if (preq.get("keywords") or preq.get("removals")
-                                                or preq.get("preserves")) else 0)
+    # ④' 轻量意图解析（并行两连）：世界观参照 + 正向要求（要求出现/要求去掉）
+    world, preq, intent_calls = stage_intent(ctx, intent, style_prompt, user_notes)
 
-    doc: dict = {}
-    try:
-        _report("编译家族模板")
-        with step("编译家族模板", images=len(paths), has_card=bool(card)):
-            doc = _compile(card, intent, base_family, style_prompt,
-                           world=world or None, positive=preq or None,
-                           budget_left=_budget_left())
-    except LLMError as e:
-        return {"ok": False, "error": f"模型调用失败：{e}",
-                "evidence": evidence, "card": card}
+    # ⑤ 编译（视觉卡 + 意图 → 家族 JSON）+ 归一化 + 悬空占位符前置调和
+    doc, terminal = stage_compile(
+        ctx, card=card, intent=intent, base_family=base_family,
+        style_prompt=style_prompt, world=world, preq=preq,
+        paths=paths, evidence=evidence, warnings=warnings,
+    )
+    if terminal is not None:
+        return terminal
 
-    if not isinstance(doc, dict) or not doc:
-        return {"ok": False, "error": "模型没有返回可解析的家族 JSON",
-                "evidence": evidence, "card": card}
-    # ★ 归一化不得让整条流水线归零（2026-10-07 端到端实测）：
-    #   _normalize 里任何一处对模型输出形状的假设不成立，都会以
-    #   AttributeError/TypeError 的形式冒到顶，**把已经花掉的 170 秒
-    #   与几十次调用全部作废**，而用户看到的只是"提炼失败"。
-    #   归一化的目的是"把脏形状擦干净"，它自己必须是**永不抛**的那一层。
-    try:
-        doc = _normalize(doc)
-        # ★ 前置调和：摘掉「引用了未声明参数」的占位符（2026-10-07 端到端实测）。
-        #   放在归一化之后、QC 之前 —— 这类错误是**机械可修**的，
-        #   让它触发"整份草稿被拒 + 再花 70s 让模型重写"是最贵的修法。
-        #   摘了什么会写进 warnings，如实告诉用户，不静悄悄。
-        _dangling = _reconcile_dangling_placeholders(doc)
-        if _dangling:
-            warnings.append(
-                "模板里有几处占位符引用了未声明的参数（" + "、".join(_dangling)
-                + "），已移除以免渲染成空串；如需保留，请在参数面板里补上同名参数。")
-    except Exception as e:                                    # noqa: BLE001
-        logger.error("家族模板归一化失败（模型输出形状异常）：%s: %s",
-                     type(e).__name__, e)
-        return {"ok": False,
-                "error": "模型返回的家族模板结构异常，没能整理成可用参数。"
-                          "可以点「重试」再试一次，或把风格描述写得更具体些。",
-                "evidence": evidence, "card": card}
+    # ⑥ QC（唯一质量门）→ 悬空占位符代码消解 → 外科自修
+    doc, errors, report, rounds = stage_qc_repair(ctx, doc, card, preq)
 
-    # ★ 出口收敛（10-03 复发修复；10-03 晚升级语义豁免 + 出厂检验）：所有分支
-    #   的校验前必须走同一条「正向要求保护 → 残留拦截 → 校验 → QC」流水线。
-    #   preq 同时携带引号短语（字面精确）与语义关键词（准星/按钮等间接指代），
-    #   保护与残留兜底共用 _pos_conflict 判定，间接反转无从漏网。
-    #   QC（family_qc）是最后一道语义闸：画幅/正向短语存活/forbid↔creative 矛盾。
-    def _finalize(d: dict) -> tuple[dict, list[str], dict]:
-        # ★ card_all_rules 代码合成（提速专项 10-04）：它只是视觉卡规则的
-        #   逐字存档（revise 时给模型参考用，不进提示词）——让模型抄一遍纯属
-        #   浪费 300–500 输出 token（编译大头 ≈ 数十秒）。由代码从视觉卡直接搬。
-        if card and not d.get("card_all_rules"):
-            d["card_all_rules"] = list(card.get("core_rules") or [])
-        # ★ 媒介 / 残留 / 漂移维度同样由代码存档（10-05 补）
-        #
-        #   这三样在视觉卡里都有，但编译产物家族的 JSON 输出字段清单里没有它们，
-        #   于是「编译完就丢了」—— 后果是 preflight 的三项漂移检查（媒介漂移、
-        #   残留泄漏、易跑偏维度）**根本没数据可查**，永远不报。
-        #
-        #   造梦师把「主媒介」放在 Priority Gate 第 3 位，媒介身份是"像不像"的
-        #   一票否决项；来源残留是它 preflight 的第 3 项检查。所以这里必须存档。
-        #   与 card_all_rules 同理：让模型抄一遍纯属浪费输出 token，代码直接搬。
-        if card:
-            if not d.get("card_medium") and card.get("medium"):
-                d["card_medium"] = card["medium"]
-            if not d.get("card_source_residue") and card.get("source_residue"):
-                d["card_source_residue"] = list(card["source_residue"])
-            if not d.get("card_drift_warnings") and card.get("drift_warnings"):
-                d["card_drift_warnings"] = list(card["drift_warnings"])
-            # ★ 规则元数据：让「按相关性选 Active Core Rules」真正生效。
-            #   没有它，family_renderer 的门控会回落成位置截取（第 6-8 条规则永远进不了提示词）。
-            if not d.get("card_rule_meta"):
-                derived = _derive_rule_meta(card)
-                if derived:
-                    d["card_rule_meta"] = derived
-        d, _notes = _protect_positive_requirements(d, preq)
-        for n in _notes:
-            logger.info("正向要求保护：%s", n)
-        d = _enforce_residue(d, card or {}, preq)
-        errors, report = _check(d, card or {})
-        if not errors:
-            try:
-                from services.family_qc import qc_family
-                d, qc_blockers, qc_warnings, qc_fixes = qc_family(d, preq, card)
-                if qc_fixes:
-                    errors, report = _check(d, card or {})   # QC 修过再验一遍
-                errors = list(errors) + list(qc_blockers)
-                if qc_warnings:
-                    report.setdefault("warnings", []).extend(qc_warnings)
-                if qc_fixes:
-                    report["qc_fixed"] = qc_fixes
-            except Exception as e:                # QC 自身故障不能弄死提炼
-                logger.warning("出厂检验异常（跳过）：%s", e)
-        return d, errors, report
-
-    doc, errors, report = _finalize(doc)
-
-    # ★ 悬空占位符先由代码消解（省一轮模型调用，也避开中转站 502）
-    if errors and any("未解析占位符" in e for e in errors):
-        doc, fixed = _resolve_unknown_slots(doc, card or {})
-        if fixed:
-            logger.info("代码消解了 %d 个模型自造的占位符，重跑校验", fixed)
-            doc, errors, report = _finalize(doc)
-
-    # 校验不过 → 外科自修（造梦师 Surgical Repair 契约的机制重写，不搬其文本）：
-    #   最多 3 个主要失败 → 最小改动修复 → 其余逐字保留 → 绝不重跑整个创作流程。
-    #   ★ 旧版第一条消息带着含 style_prompt 的完整 intent —— 用户提示词包里
-    #     「标签:内容」的格式在自修轮继续诱导模型犯同样的错（实测 22:32 自修无效的根因）。
-    #     外科模式下模型只面对「上一版产物 + 错误清单」，诱导源被移出上下文。
-    rounds = 0
-    while errors and rounds < MAX_REPAIR and not _stop():
-        rounds += 1
-        _report(f"校验自修第 {rounds} 轮")
-        logger.info("家族校验未通过，第 %d 次外科自修：%s", rounds, errors[:2])
-        try:
-            repair = chat([
-                {"role": "system", "content": _COMPILE_SYSTEM},
-                {"role": "user", "content": json.dumps(
-                    {"visual_card": card}, ensure_ascii=False)},
-                {"role": "assistant", "content": json.dumps(doc, ensure_ascii=False)},
-                {"role": "user", "content": _REPAIR_TMPL.format(
-                    errors="\n".join(f"- {e}" for e in errors[:3]))},
-            ], temperature=0.2, max_tokens=2600, premium=True,
-            timeout=FORGE_REPAIR_TIMEOUT_SEC,
-            wall_budget=min(FORGE_REPAIR_TIMEOUT_SEC, _budget_left()),
-               response_format={"type": "json_object"})
-            fixed = extract_json(_strip_fence(repair))
-            if isinstance(fixed, dict) and fixed:
-                doc = _normalize(fixed)
-                doc, errors, report = _finalize(doc)   # 自修产物同样过保护+残留+校验+QC
-        except LLMError as e:
-            logger.warning("自修轮 %d 调用失败：%s", rounds, e)
-            break
-
-    # ★ 预算到点 vs 用户主动中止，要区别对待（2026-10-07）
-    #   用户主动中止 → 草稿他不要了，返回取消是对的。
-    #   **预算到点** → 草稿已经编译好了（可能还过了 QC），
-    #     这时候把它扔掉、让用户重跑 3 分钟，是最糟的处理。
-    #     所以：预算到点且手上已有可用 doc，就**继续往下走**，
-    #     只把"跳过了自修轮"记进 warnings，如实告诉用户。
+    # ★ 预算到点 vs 用户主动中止（2026-10-07）：用户中止 → 草稿他不要了，返回取消；
+    #   **预算到点** → 草稿已编译好（可能还过了 QC），扔掉让用户重跑 3 分钟
+    #   是最糟的处理，所以继续往下走，只把"跳过了自修轮"写进 warnings 如实告知。
     if _stop() and not _budget_hit:
         return {**dict(_CANCELLED), "card": card}
     if _budget_hit:
@@ -1034,28 +882,12 @@ def forge(
         logger.info(msg)
         warnings.append(msg)
 
-    elapsed = round(time.time() - started, 2)
-    # 分段耗时：用户问"为什么提炼好几分钟"时，能直接看出慢在解构还是编译。
-    report["elapsed_sec"] = elapsed
-    report["decode_sec"] = decode_sec
-    report["compile_sec"] = round(elapsed - decode_sec, 2)
-    report["llm_calls"] = 1 + len(decodes) + intent_calls + 1 + rounds
-    # 角色 + 逐图解构 + 意图层（世界观/正向要求，命中才计） + 编译 + 自修
-    # （编译合并 2026-10-04：跨图共识 LLM 调用已砍，共识由 _synthesize 代码投票承担）
-    logger.info("模板提炼完成：%.1fs（解构 %.1fs / 编译 %.1fs，%d 次调用）",
-                elapsed, decode_sec, elapsed - decode_sec, report["llm_calls"])
+    return stage_finish(
+        ctx, doc=doc, card=card, decodes=decodes, evidence=evidence,
+        errors=errors, report=report, warnings=warnings, rounds=rounds,
+        decode_sec=decode_sec, intent_calls=intent_calls,
+    )
 
-    return {
-        "ok": not errors,
-        "spec": doc,
-        "card": card,                 # 视觉卡：可复用资产，解构一次反复编译
-        "decodes": [{k: v for k, v in d.items() if not k.startswith("_")} for d in decodes],
-        "evidence": evidence,
-        "errors": errors,
-        "report": report,
-        "warnings": warnings,
-        "repair_rounds": rounds,
-    }
 
 
 def revise(spec: dict, feedback: str, theory: str = "",

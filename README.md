@@ -258,21 +258,22 @@ cd backend
 python tests/run_all.py
 ```
 
-24 个文件共 **995 项断言**，全部离线、不花任何真实 API 调用：
+25 个文件**全部通过**，共 **957 项断言**（另 4 个文件按「通过 N 项」计数，不并入断言口径），全程离线、零真实 API 调用：
 
 | 文件 | 覆盖 | 数量 |
 |---|---|---|
 | `test_llm_resilience.py` | 通道容错：上游「假装成功」时空响应 → 重试换通道 | 101 |
 | `test_api_smoke.py` | HTTP 端到端：健康、家族、上传攻击、路径穿越、注入拦截、坏 YAML 隔离、SSE、审计 | 88 |
-| `test_forge.py` | 工坊：草稿提炼、修订、安装为家族、模板库 | 81 |
+| `test_forge.py` | 工坊：草稿提炼、修订、安装为家族、模板库、**参考图越权校验**、阶段预算闸、形状容错 | 148 |
 | `test_security.py` | Origin 白名单/重复头、令牌模式、**extract_card 预览降级**、**SSE 断连全链路（1 次 vs 9 次模型调用）**、许可回收 | 57 |
-| `test_agent_loop.py` | 正常路径、Schema 校验、重复熔断、步数护栏、观察截断、预览模式、降级 | 56 |
+| `test_agent_loop.py` | 正常路径、Schema 校验、重复熔断、步数护栏、观察截断、预览模式、降级、**上下文 token 预算双闸**、护栏常量口径 | 85 |
 | `test_renderer.py` | 反推 forbid 两道过滤、占位符三个坑、冲突检测 | 55 |
 | `test_identity.py` | 访客码 / 绑定 / 登录、会话隔离、数据库懒建表 | 62 |
 | `test_preflight.py` | 编译后漂移自检 + 核心规则按相关性选择 | 60 |
 | `test_image_gen.py` | 生图：画幅只三档（表达不了就跟随原图）+ 重试计划 | 46 |
 | `test_public_isolation.py` | 公开版隔离：无身份不得列举/写入他人图片 | 42 |
 | `test_card.py` | 创作卡提取：色名映射、本地档、三级分级、提示词真的被改变、异常路径、缓存 | 42 |
+| `test_concurrency.py` | 线程并发不超卖、损坏的 SQLite 文件、**磁盘满/只读/目录被删**、**多 worker 自检**、上游网络层异常 | 44 |
 | `test_governance.py` | 额度预扣/冲正、**票据一次性兑现、崩溃后不泄漏额度**、配额耗尽、会话隔离 | 36 |
 | `test_context_store.py` | SQLite 读写、双路召回、分词器迁移、索引自愈、**历史回放的 tools 协议配对** | 40 |
 | `test_admin_visibility.py` | 管理员面板：独立身份 + 票据下载 + 软删除（底线：用户仍互相不可见） | 42 |
@@ -292,12 +293,6 @@ python tests/run_all.py
 > 注意各文件输出格式不统一（`OK` / `✓` / `✅` 三种都有），
 > 且有 7 个文件不打印「结果：N 通过」汇总行。
 >
-> ⚠️ **当前有 1 项断言是红的**：`test_repair.py` 的
-> 「★ 失败时额度已退还」。它在**改动前后、纯净环境与 CI 环境下都稳定失败**，
-> 不是环境问题 —— 是 `repair_image` 失败路径上的额度冲正没生效。
-> 已知问题，未修（修它要动 `governance/guard.py`，不在本次文档整理范围内）。
-> CI 因此是红的，如实照报。
-
 另有一个家族 YAML 契约自检（等价于启动时的 preflight，`start.bat` 第 4 步跑的就是它）：
 
 ```bat
@@ -370,7 +365,7 @@ python -c "from services.template_manager import inventory; from tools.registry 
 │   │   ├── routers/       HTTP
 │   │   ├── agents/        门面
 │   │   └── templates/     家族 YAML + 风格模板
-│   └── tests/             自测（run_all.py，24 个文件 / 995 项断言）
+│   └── tests/             自测（run_all.py，25 个文件 / 957 项断言，全绿）
 ├── frontend/
 │   └── src/               App / ParamForm / api
 ├── deploy/                打包与清洗脚本（build_release.py / prepare_public.py）
@@ -391,7 +386,7 @@ python -c "from services.template_manager import inventory; from tools.registry 
 - [x] 参数驱动的动态前端表单
 - [x] SSE 实时工具轨迹
 - [x] 原图 / 成品对比视图
-- [x] 自测套件（24 个文件 / 995 项断言，1 项已知失败）
+- [x] 自测套件（25 个文件 / 957 项断言，**全部通过**）
 - [x] 独立复审 + 全量修复（5 个 P0、6 个 P1 级问题）
 - [x] **创作卡提取**（本地 Pillow 档 + VLM 档）—— 反推 forbid 自此真正生效
 - [x] **访问控制**：写操作 Origin 白名单（默认）+ 本地令牌（可选）

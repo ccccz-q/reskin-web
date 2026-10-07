@@ -131,7 +131,10 @@ PREMIUM_MODEL = (os.getenv("PREMIUM_MODEL") or "").strip() or DEEPSEEK_MODEL
 IMAGE_BACKEND = (os.getenv("IMAGE_BACKEND") or "openai").strip().lower()
 if IMAGE_BACKEND not in ("openai", "ark"):
     raise ValueError(f"IMAGE_BACKEND 只能是 openai 或 ark，当前是 {IMAGE_BACKEND!r}")
-# 出图单独放宽超时：gpt-image-2 实测 43-110s，中转站拥堵时会超过全局 180s，
+# 出图单独放宽超时：gpt-image-2 实测 43-110s，中转站拥堵时会超过全局预算。
+#   ★ 注意这里的 180s 是**本仓库 .env 里已调过的值**，代码默认是 60s
+#     （见下方 REQUEST_TIMEOUT_SEC）。写注释时不说清这一点，
+#     读的人会以为默认就是 180s——这正是「注释说 A、代码做 B」的那类偏差。，
 # 用 REQUEST_TIMEOUT_SEC 会稳定 APITimeoutError。
 IMAGE_TIMEOUT_SEC = int(os.getenv("IMAGE_TIMEOUT_SEC", "300"))
 

@@ -171,6 +171,70 @@ def bump_counter(key: str, delta: int = 1, *, db: Path | str | None = None) -> i
     return int(row["value"]) if row else 0
 
 
+def try_increment_capped(key: str, limit: int, *,
+                         db: Path | str | None = None) -> tuple[bool, int]:
+    """**条件自增**：只有当前值 < limit 时才加1。返回 (是否抢到, 加完后的值)
+
+    ★ 为什么必须有这个（2026-10-07 M1：多worker 下配额护栏失效）
+    ------------------------------------------------------
+    原来的写法是「读 → 判断 → 加」三步，外面套一把 `threading.Lock`：
+
+        with _reserve_lock:
+            if remaining_quota(tid)["exhausted"]: raise
+            bump_counter(key, 1)
+
+    在**单进程**内这把锁够用。但 `threading.Lock` 只在进程内有效 ——
+    部署成 4 个 worker 时，四个进程各自持有自己的锁、各自维护内存视图，
+    互相看不见对方的扣减。实测（tests/probe_multiworker.py）：
+    上限 10、4 进程各预扣 8 次 → **总预扣 12，超卖**。
+    配额是**保护 API 花费**的闸，失效就是真金白银的损失。
+
+    修法：把"判断"和"加"合并成**一条 SQL**，让数据库自己保证原子性：
+
+        UPDATE session_counter SET value = value + 1
+         WHERE key = ? AND value < ?
+
+    `cursor.rowcount == 1` 表示抢到了额度，`0` 表示已满。
+    SQLite 保证单条 UPDATE 的原子性，**天然跨进程**。
+
+    ★ 为什么要 INSERT ... ON CONFLICT 而不是直接 UPDATE：
+      第一次用这个 key 时行还不存在，UPDATE 影响 0 行，会被误判成"已满"。
+      所以先用 upsert 播种（value=0），再走条件 UPDATE。
+
+    ★ limit <= 0 表示不限额度（与 MAX_GENERATIONS_PER_SESSION<=0 同义），
+      此时直接自增并返回 True。
+    """
+    now = datetime.now().isoformat(timespec="seconds")
+    with write_lock, _open(db) as conn:
+        if limit <= 0:
+            conn.execute(
+                "INSERT INTO session_counter(key, value, updated) VALUES(?,1,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=value+1, updated=excluded.updated",
+                (key, now),
+            )
+            row = conn.execute(
+                "SELECT value FROM session_counter WHERE key=?", (key,)
+            ).fetchone()
+            return True, (int(row["value"]) if row else 1)
+        # ① 播种：没有这一行就先建一个 0
+        conn.execute(
+            "INSERT INTO session_counter(key, value, updated) VALUES(?,0,?) "
+            "ON CONFLICT(key) DO NOTHING",
+            (key, now),
+        )
+        # ② 条件自增：只有 value < limit 才加 —— 这一步是原子的
+        cur = conn.execute(
+            "UPDATE session_counter SET value = value + 1, updated=? "
+            "WHERE key=? AND value < ?",
+            (now, key, int(limit)),
+        )
+        got = cur.rowcount == 1
+        row = conn.execute(
+            "SELECT value FROM session_counter WHERE key=?", (key,)
+        ).fetchone()
+        return got, (int(row["value"]) if row else 0)
+
+
 def get_counter(key: str, *, db: Path | str | None = None) -> int:
     with _open(db) as conn:
         row = conn.execute("SELECT value FROM session_counter WHERE key=?", (key,)).fetchone()

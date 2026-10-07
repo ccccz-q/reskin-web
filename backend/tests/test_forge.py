@@ -580,5 +580,191 @@ check("★ 解构按阶段配额拿预算（而不是固定值）",
       "wall_budget=_decode_budget()" in _inspect.getsource(sf.forge), "")
 
 print()
+# ══════════════════════════════════════════════════════════
+# forge() 拆分后的预算闸不变式（2026-10-07重构）
+# ══════════════════════════════════════════════════════════
+# ★ 为什么这组断言长这样：forge() 从 306 行拆成"编排 + forge_stages 六个阶段"，
+#   三道预算闸的判据搬进了 ForgeCtx。搬的过程中最容易出的错是**每个阶段各自
+#   算一次 deadline** —— 那样每阶段都拿到满额预算，整条链路的墙钟硬闸等于
+#   没了（这正是本次拆分唯一的真风险）。
+#   所以这组断言不测"跑得通"，而是直接钉住"预算只有一个起点"这个结构性质。
+print("[测试 10] ★ 墙钟预算只有一个起点（拆分后不许每个阶段重算）")
+from services import forge_stages as fstages               # noqa: E402
+
+check("阶段模块存在且导出 ForgeCtx",
+      hasattr(fstages, "ForgeCtx") and hasattr(fstages, "DECODE_SHARE"),
+      f"DECODE_SHARE={fstages.DECODE_SHARE}")
+check("★ 阶段配额就是 55%（不是被顺手改过的数）",
+      fstages.DECODE_SHARE == 0.55, str(fstages.DECODE_SHARE))
+
+# arm() 是设置 deadline 的**唯一**入口：整个阶段模块里只有它碰 self.deadline
+_stages_src = _inspect.getsource(fstages)
+_stages_lines = _stages_src.splitlines()
+_stages_tree = _ast.parse(_stages_src)
+
+
+def _fn_src(node) -> str:
+    """按 AST 节点切出源码文本（inspect.getsource 只吃真实函数对象，不吃节点）"""
+    return "\n".join(_stages_lines[node.lineno - 1:node.end_lineno])
+
+
+_arm_srcs = [n.name for n in _ast.walk(_stages_tree)
+             if isinstance(n, _ast.FunctionDef) and "self.deadline =" in _fn_src(n)]
+check("★ 全模块只有 arm() 能写 deadline（其余阶段只能读）",
+      _arm_srcs == ["arm"], f"写 deadline 的函数：{_arm_srcs}")
+# 「重置预算」的特征是**拿总预算加到当前时间上**去造一个新 deadline。
+# 只做比较/打日志（如 stop() 里的 time.time() > deadline）不算。
+_recompute = [n.name for n in _ast.walk(_stages_tree)
+              if isinstance(n, _ast.FunctionDef)
+              and n.name not in ("arm", "decode_budget")
+              and "FORGE_TOTAL_BUDGET_SEC +" in _fn_src(n)]
+check("★ 除 arm() 外没有阶段拿 总预算 加到 time.time() 上另起deadline（=预算不会被重置）",
+      not _recompute, f"可疑函数：{_recompute}")
+
+# forge() 自己也只能 arm 一次
+_forge_src = _inspect.getsource(sf.forge)
+check("★ forge() 只 arm 一次（多处 arm = 预算被重置）",
+      _forge_src.count("ctx.arm(") == 1, f"出现 {_forge_src.count('ctx.arm(')} 次")
+
+# ── 行为级：deadline 真的被所有阶段共享 ──
+import time as _time10                                          # noqa: E402
+
+_now10 = _time10.time()
+_c = fstages.ForgeCtx(cancelled=None, progress=None)
+check("未 arm 时预算无限（不设硬闸）",
+      _c.budget_left() == float("inf"), str(_c.budget_left()))
+_c.arm(_now10, _now10 + 120.0)          # 硬闸 = 起点 +120s
+_c.deadline = _now10 + 60.0             # 假装已经过去 60s
+_left = _c.budget_left()
+check("★ arm 之后所有阶段读到的是同一份剩余额度",
+      59.0 < _left <= 60.0, f"剩 {_left:.1f}s")
+# 连续读两次：额度只随时间递减，不会"读一次就重新给一份"
+_l1, _l2 = _c.budget_left(), _c.budget_left()
+check("★ 剩余额度不会因为读了一次就变（不是每次重算起点）",
+      _l2 <= _l1 <= 60.0, f"{_l1:.3f} → {_l2:.3f}")
+# 阶段配额：拿剩余额度 × 55% 作为解构额度
+check("★ 解构额度 = 剩余 × 阶段配额（且不超过单图上限）",
+      30.0 <= fstages.ForgeCtx.decode_budget(_c) <= 60.0 * 0.55,
+      str(round(fstages.ForgeCtx.decode_budget(_c), 2)))
+# 预算耗尽 → 剩余归零，不给负数
+_c.deadline = _now10 - 1.0
+check("★ 预算耗尽后剩余归零（不给负数，也不回满）",
+      _c.budget_left() == 0.0, str(_c.budget_left()))
+
+print()
+print("[测试 11] ★ 中止语义：用户中止 ≠ 预算到点（拆分不许把两者混同）")
+# 用户中止 →  forge 返回 cancelled，且不产出草稿
+_r_cancel = sf.forge("任意风格", cancelled=lambda: True)
+check("用户中止 → cancelled", bool(_r_cancel.get("cancelled")), str(_r_cancel)[:60])
+check("用户中止 → 不冒充成功", not _r_cancel.get("spec")
+      and not _r_cancel.get("ok"), str(_r_cancel.get("ok")))
+
+# 预算到点 → ForgeCtx 只置budget_hit 标志，**不**当成用户中止
+_bc = fstages.ForgeCtx(cancelled=lambda: False, progress=None)
+_bc.arm(_now10, _now10 - 1.0)          # deadline 已在过去
+_hit = _bc.stop()
+check("★ 预算到点 → stop() 返回 True", _hit is True)
+check("★ 预算到点 → budget_hit 置位（供 forge 区分收尾方式）",
+      _bc.budget_hit is True, str(_bc.budget_hit))
+check("★ 预算到点不会改写 cancelled 探针的语义（探针仍 False）",
+      _bc.cancelled() is False, "")
+
+_uc = fstages.ForgeCtx(cancelled=lambda: True, progress=None)
+_uc.arm(_now10, _now10 + 9999.0)       # 预算还很宽裕
+check("用户中止 → stop() 也返回 True", _uc.stop() is True)
+check("★ 用户中止**不会**置 budget_hit（否则草稿会被当预算到点保留）",
+      _uc.budget_hit is False, str(_uc.budget_hit))
+
+# 探针自己抛异常 → 当没取消（拆分时最容易漏的except 分支）
+class _Boom:
+    def __call__(self):
+        raise RuntimeError("探针炸了")
+
+
+_ec = fstages.ForgeCtx(cancelled=_Boom(), progress=None)
+_ec.arm(_now10, _now10 + 9999.0)
+check("★ 中止探针抛异常 → 当没中止（不误伤整条链路）",
+      _ec.stop() is False, "")
+check("★ 探针异常也不会误置 budget_hit", _ec.budget_hit is False, "")
+
+# 进度回调抛异常 → 吞掉（进度上报绝不能弄死提炼）
+_p = fstages.ForgeCtx(cancelled=None, progress=lambda m: 1 / 0)
+_p.arm(_now10, _now10 + 9999.0)
+try:
+    _p.report("测试")
+    check("★ 进度回调抛异常被吞掉", True)
+except Exception as e:                                        # noqa: BLE001
+    check("★ 进度回调抛异常被吞掉", False, repr(e))
+
+print()
+print("[测试 12] ★ 阶段函数是模块级的（不是嵌套闭包）")
+_forge_tree = _ast.parse(_forge_src)
+_inner = [n.name for n in _ast.walk(_forge_tree)
+          if isinstance(n, _ast.FunctionDef)
+          and n is not next(f for f in _forge_tree.body
+                            if isinstance(f, _ast.FunctionDef) and f.name == "forge")]
+check("forge() 里只剩中止探针一个内嵌函数（阶段全部外提）",
+      _inner == ["_stop"], str(_inner))
+_stage_names = [n for n in ("stage_evidence", "stage_card", "stage_intent",
+                           "stage_compile", "stage_qc_repair", "stage_finish")
+                if hasattr(fstages, n)]
+check("六个阶段函数都在模块级", len(_stage_names) == 6, str(_stage_names))
+check("阶段函数不靠模块级全局拿共享状态（都吃 ForgeCtx）",
+      all("ctx: ForgeCtx" in _inspect.signature(getattr(fstages, n)).__str__()
+          or "ctx" in _inspect.signature(getattr(fstages, n)).parameters
+          for n in _stage_names),
+      "")
+
+
+# ══════════════════════════════════════════════════════════
+# 参考图归属校验（2026-10-07 独立审查 S1：实测复现的越权）
+# ══════════════════════════════════════════════════════════
+# ★ 事故：`_resolve_images()` 只做目录白名单（防路径穿越），**不判断图属于谁**。
+#   攻击者拿到别人的图 URL 传给 /api/forge/draft-async 就能读走别人的照片，
+#   还会喂进 VLM 做解构、把文件名存进 forge 记录。
+#   而 routers/image.py 里有 5 处 may_read —— forge 是唯一漏网的那道门。
+#   这条断言就是那道门：别人的图必须被跳过，且**跳过要被记日志**。
+print("\n[测试 13] 参考图不能越权读取")
+import routers.forge as _fg                                # noqa: E402
+import tempfile as _tf
+from PIL import Image as _Img                             # noqa: E402
+
+# ★ 会话 id 必须是**合法格式**（32 位十六进制）——踩过一次：
+#   我用 mkdtemp 的 "ownerA_xxx" 当目录名，结果 may_read 认不出这是会话目录，
+#   自己的图也读不到，看起来像"修复把所有人都挡在门外"。
+#   这里显式用两个合法 sid，目录名 = sid。
+_SIDA = "a1a1a1a1bbbb4cccc8ddd4eeee5ffff6"
+_SIDB = "b1b1b1b1bbbb4cccc8ddd4eeee5ffff6"
+_url_of = lambda root: "/images/" + Path(root).name + "/2026-10-08/pic.png"
+# ★ 不改 config.IMAGE_STORAGE_DIR，而是**在真实存储根下**造两个会话目录。
+#   踩了两次才发现：
+#     ① `image_access` 上没有 IMAGE_STORAGE_DIR 属性（它是运行时 from config 读）；
+#     ② 就算改了 config.IMAGE_STORAGE_DIR 也没用——
+#        `agents.image_agent.normalize_reference` 在**模块加载时**就把路径算好了，
+#       改配置不会重算，结果"自己的图"也解析到别处 → 全部被跳过。
+#   所以最稳的做法是：用真实的存储根，按真实目录结构造文件。
+import config as _cfg                                     # noqa: E402
+_ST = Path(_cfg.IMAGE_STORAGE_DIR)
+_roota = str(_ST / _SIDA)
+_rootb = str(_ST / _SIDB)
+for _root in (_roota, _rootb):
+    _sub = Path(_root) / "2026-10-08"
+    _sub.mkdir(parents=True, exist_ok=True)
+    _Img.new("RGB", (32, 32), (120, 140, 160)).save(_sub / "pic.png")
+try:
+    mine = _fg._resolve_images([_url_of(_roota)], sid=_SIDA)
+    check("★ 自己的图能读到", len(mine) == 1, f"读到 {len(mine)} 张")
+    theirs = _fg._resolve_images([_url_of(_rootb)], sid=_SIDA)
+    check("★ ★ 别人的图被跳过（越权已堵）", theirs == [], f"读到 {theirs}")
+    mixed = _fg._resolve_images(
+        [_url_of(_roota), _url_of(_rootb)], sid=_SIDA)
+    check("混合提交时只留下自己的那一张", len(mixed) == 1, f"{mixed}")
+finally:
+    # 清理：别在真实存储根里留测试目录
+    import shutil as _sh
+    for _root in (_roota, _rootb):
+        _sh.rmtree(_root, ignore_errors=True)
+
+print()
 print(f"结果：{PASS} 通过 / {FAIL} 失败")
 sys.exit(1 if FAIL else 0)

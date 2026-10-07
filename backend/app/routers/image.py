@@ -705,9 +705,16 @@ async def gallery(limit: int = 24, kinds: str = "", force: bool = False,
                     _gallery_sync, 500, sid, allow)
                 bucket["ts"] = _time.monotonic()
     items = bucket["data"]
-    # 后台预热缩略图（fire-and-forget）：用户点开仓库前，缩略图已在磁盘
-    _threading.Thread(target=_prewarm_thumbs, args=(items["items"],),
-                      name="thumb-prewarm", daemon=True).start()
+    # ★ 后台预热缩略图：**单worker + 请求合并**（2026-10-07 长稳压测抓到的线程泄漏）
+    #   旧写法是「每次请求 new 一个 Thread 并start」—— 看着是fire-and-forget，
+    #   实测 30 分钟 11 万请求后**堆到 23242 个线程 / 949 MB**
+    #   （长稳压测 tests/soak_long.py 实测，后端进程 PID 28876）。
+    #   为什么危险：预热每张图要开图+缩放+写盘，单个线程要跑几百毫秒；
+    #   请求来得比它快时线程只增不减 → 线程/内存双涨，机器最终拒绝新连接
+    #   （同一轮压测错误率 17%）。这不是"慢"，是**不可用**。
+    #   现在：全局**最多一个**预热线程；它忙时新请求只记一个"待办"标记，
+    #   跑完再补一轮。不丢请求，也不涨线程。
+    _schedule_thumb_prewarm(items["items"])
     allow = {k.strip() for k in kinds.split(",") if k.strip()} if kinds else None
     if allow:
         items = {**items, "items": [x for x in items["items"] if x["kind"] in allow],
@@ -825,6 +832,57 @@ def _thumb_make_sync(path: str, w: int) -> str:
         im.save(tmp, "JPEG", quality=82)
     os.replace(tmp, tpath)
     return str(tpath)
+
+
+# ── 缩略图预热调度：全局单worker + 请求合并 ─────────────────────
+#
+# ★ 2026-10-07 长稳压测实测到的线程泄漏（30 分钟 11 万请求 → 23242 线程 / 949 MB）
+#   旧写法每次画廊请求都 new 一个 Thread 并 start。预热要开图+缩放+写盘，
+#   单线程几百毫秒；请求来得比它快，线程就只增不减。
+#   后果不是"慢"，是**线程耗尽后机器拒绝新连接**（同轮错误率 17%）。
+#
+#   正确形态是"至多一个worker + 忙时合并请求"：
+#     · 正在跑 → 只置一个 pending 标记，不新建线程；
+#     · 跑完看到 pending → 把自己再排一轮（合并多次请求成一次预热）。
+_thumb_prewarm_lock = threading.Lock()
+_thumb_prewarm_running = False
+_thumb_prewarm_pending = False
+
+
+def _schedule_thumb_prewarm(items: list) -> bool:
+    """请求一次缩略图预热。**不会**每次都新建线程。返回是否新建了 worker。"""
+    global _thumb_prewarm_running, _thumb_prewarm_pending
+    if not items:
+        return False
+    with _thumb_prewarm_lock:
+        if _thumb_prewarm_running:
+            # 已在跑：记一个待办，等它结束补一轮。不丢请求，也不涨线程。
+            _thumb_prewarm_pending = True
+            return False
+        _thumb_prewarm_running = True
+
+    def _run() -> None:
+        # ★ global 必须写在函数最前面：Python 要求「先声明 global，再赋值」，
+        #   写在 try 之后再声明会SyntaxError（"assigned to before global declaration"）
+        global _thumb_prewarm_running, _thumb_prewarm_pending
+        try:
+            # 反复做，直到没有新的待办请求（每轮开头重新看一眼列表）
+            while True:
+                try:
+                    _prewarm_thumbs(items)
+                except Exception as e:                    # noqa: BLE001
+                    logger.warning("缩略图预热失败（不影响主流程）：%s", e)
+                with _thumb_prewarm_lock:
+                    if not _thumb_prewarm_pending:
+                        _thumb_prewarm_running = False
+                        return
+                    _thumb_prewarm_pending = False
+        except BaseException:            # 线程里绝不让异常逃出去
+            with _thumb_prewarm_lock:
+                _thumb_prewarm_running = False
+
+    threading.Thread(target=_run, name="thumb-prewarm", daemon=True).start()
+    return True
 
 
 def _prewarm_thumbs(items: list, w: int = 360, limit: int = 60) -> None:

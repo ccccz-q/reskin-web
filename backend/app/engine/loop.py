@@ -173,6 +173,351 @@ def _final_fallback_reply(ctx) -> str:
             "（比如「主体不动、只换成水彩质感」），我重新试一次。")
 
 
+@dataclass
+class LoopCtx:
+    """一轮 `run()` 的共享状态（显式传参，不做模块级全局）
+
+    ★ 为什么是对象而不是把状态散成参数：
+      五个阶段（组装消息 / 调模型 / 解析 tool_calls / 执行工具 / 收尾）都要读写
+      同一批量（messages、trace、repeat_counts、forced_final…）。用显式对象传递
+      是为了让"谁改了什么"一眼可见，也便于阶段函数离线单测。
+    ★ emit / aborted 为什么是方法而不是 `run()` 里的闭包：
+      闭包捕获的 on_event / should_abort 没法在阶段函数间传递；改成方法后
+      阶段函数只认 ctx 一个入口。语义与旧闭包**逐字一致**（含异常吞掉）。
+    """
+
+    result: AgentRunResult
+    thread_id: str
+    on_event: Callable[[str, dict], None] | None = None
+    should_abort: Callable[[], bool] | None = None
+    memory_update: bool = True
+    messages: list[dict] = field(default_factory=list)
+    tool_ctx: Any = None                                  # ToolContext
+    tools_spec: list = field(default_factory=list)
+    repeat_counts: dict[str, int] = field(default_factory=dict)
+    forced_final: bool = False        # 出图成功后强制模型写总结，不再给工具
+    # 已经推给前端的图片 URL —— 用于「同一张图只推一次」
+    emitted_image_url: str | None = None
+
+    def emit(self, event: str, **payload: Any) -> None:
+        if self.on_event:
+            try:
+                self.on_event(event, payload)
+            except Exception as e:                 # 推送失败绝不能拖垮 Agent
+                logger.warning("事件回调失败(%s)：%s", event, e)
+
+    def aborted(self) -> bool:
+        if self.should_abort is None:
+            return False
+        try:
+            return bool(self.should_abort())
+        except Exception:                          # 探针自己出错就当没取消
+            return False
+
+
+def _prepare(ctx: LoopCtx, *, user_message: str, image_path: str,
+             image_info: dict | None, card: dict | None, allow_spend: bool,
+             quota_key: str, extra_prompt: str, extra_mode: str,
+             history_limit: int, memory_update: bool) -> None:
+    """阶段①组装消息：能力裁剪 → 上下文 → system prompt → ToolContext
+
+    就地填好 `ctx.messages` / `ctx.tool_ctx` / `ctx.tools_spec` 与 `ctx.result.trace`。
+    """
+    # ── 能力裁剪：预览模式下计费工具连 Schema 都不给模型看见
+    enabled = set(TOOL_NAMES)
+    if not allow_spend:
+        enabled -= set(SPEND_TOOLS)
+
+    families = compact_families_for_prompt()
+    long_term = context_store.load_long_term(ctx.thread_id) if memory_update else {}
+    # ★ 用 history_for_llm 而不是 history：
+    #   后者是「如实呈现库里的内容」，前者额外做 tools 协议配对净化。
+    #   直接喂 history 会在两种正常场景下构造出非法请求体（窗口截断 /
+    #   上一轮提前中止），服务端一律 400 —— 见 context_store.history_for_llm。
+    history = _history_within_budget(ctx.thread_id, history_limit)
+
+    system_prompt = build_system_prompt(
+        enabled_tools=enabled,
+        families=families,
+        image_info=image_info,
+        card=card,
+        long_term=long_term,
+    )
+    ctx.messages = build_messages(user_message, system_prompt=system_prompt,
+                                 history=history)
+    ctx.result.trace = [dict(m) for m in ctx.messages]
+
+    ctx.tool_ctx = ToolContext(
+        thread_id=ctx.thread_id,
+        # ★ 额度账本键必须原样透传（2026-10-07 修复的额度绕过）：
+        #   漏了它工具会退回按 thread_id 计费，跨会话配额就形同虚设。
+        quota_key=quota_key or "",
+        image_path=image_path,
+        card=dict(card or {}),
+        image_info=dict(image_info or {}),
+        allow_spend=allow_spend,
+        # 用户自定义提示词：请求级直传，不经模型转述（见 ToolContext 注释）
+        extra_prompt=extra_prompt or "",
+        extra_mode=extra_mode or "append",
+    )
+
+    # 用户消息入库
+    context_store.append_message(ctx.thread_id, "user", user_message)
+    ctx.tools_spec = openai_tools(enabled)
+
+
+# 「本步已就地收尾，别再往下走」的哨兵。
+# ★ 为什么不用 None：旧代码里 resp 为 None 会在 `resp.get("usage")` 上抛
+#   AttributeError（可见的崩溃）；用 None 当返回值会把这种"上游返回了脏东西"
+#   悄悄吞成一次正常收尾 —— 那是**改语义**，不是重构。
+#   哨兵让"上游真的返回了 None"仍然按原样崩给你看。
+_STOP = object()
+
+
+def _call_model(ctx: LoopCtx) -> Any:
+    """阶段② 调模型。返回 `_STOP` 表示"已就地收尾，别再往下走"。
+
+    forced_final 时走 summarize_for_final（短超时不换通道），否则走主循环的
+    chat_with_tools —— 两条通道的容错档位差异是2026-10-06 刻意分开的，别合并。
+    """
+    if ctx.forced_final:
+        # ★ 2026-10-06：出图后的收尾文案改走 summarize_for_final。
+        #   此前复用 chat_with_tools，继承了主循环的完整容错档位
+        #   （主通道 60s×2 + 备通道 60s + 退避 ≈ 最坏 2 分 12 秒，
+        #   实测用户确实卡了 2 分钟）。图已经生成好，这段文案
+        #   不值这个等待 —— 不换通道、短超时、几乎不重试。
+        try:
+            return summarize_for_final(ctx.messages)
+        except LLMError as e:
+            # ★ 2026-10-06 修正：收尾失败**不能**报成整轮失败。
+            #   图已经生成落盘了，用户手上就是成品 —— 缺的只是一段说明文字。
+            #   旧代码在此 break 走 llm_error，前端会显示「（模型调用失败）…」，
+            #   用户会以为这趟白跑了、甚至去重做一张。改成给一段兜底文案，
+            #   并明确告诉他图已经好了。
+            logger.warning("收尾文案生成失败（图已生成，仅缺说明文字）：%s", e)
+            ctx.result.stopped_reason = "final_summary_failed"
+            ctx.result.reply = _final_fallback_reply(ctx.tool_ctx)
+            audit("agent_final_summary_failed",
+                  thread_id=ctx.thread_id, error=str(e)[:200])
+            return _STOP
+    try:
+        return chat_with_tools(
+            ctx.messages,
+            tools=ctx.tools_spec,
+            tool_choice="auto",
+        )
+    except LLMError as e:
+        logger.error("LLM 调用失败：%s", e)
+        ctx.emit("error", stage="llm", message=str(e)[:200])
+        ctx.result.stopped_reason = "llm_error"
+        ctx.result.reply = f"（模型调用失败）{e}"
+        audit("agent_llm_error", thread_id=ctx.thread_id, error=str(e)[:200])
+        return _STOP
+
+
+def _record_assistant(ctx: LoopCtx, resp: dict) -> tuple[str, list[dict]]:
+    """阶段③ 解析 tool_calls：累加 usage → 推送 → 助手消息入trajectory/历史
+
+    返回 (content, calls)。助手消息**必须带 tool_calls 结构**，否则下一轮
+    tools 协议不认（前端只会看到"模型调用失败"）。
+    """
+    for key, val in (resp.get("usage") or {}).items():
+        if isinstance(val, int):
+            ctx.result.usage[key] = ctx.result.usage.get(key, 0) + val
+
+    content = resp.get("content") or ""
+    calls = resp.get("tool_calls") or []
+    if content:
+        ctx.emit("token", text=content)
+    for call in calls:
+        ctx.emit("tool_call", name=call["name"], arguments=call["arguments"])
+
+    assistant_msg: dict[str, Any] = {"role": "assistant"}
+    assistant_msg["content"] = content or None
+    if calls:
+        assistant_msg["tool_calls"] = [
+            {
+                "id": c["id"],
+                "type": "function",
+                "function": {
+                    "name": c["name"],
+                    "arguments": json.dumps(c["arguments"], ensure_ascii=False),
+                },
+            }
+            for c in calls
+        ]
+    ctx.messages.append(assistant_msg)
+    ctx.result.trace.append(dict(assistant_msg))
+    if content:
+        context_store.append_message(ctx.thread_id, "assistant", content)
+    if calls:
+        context_store.append_message(
+            ctx.thread_id, "assistant", None, meta={"tool_calls": calls}
+        )
+    return content, calls
+
+
+def _execute_tools(ctx: LoopCtx, step_i: int, calls: list[dict]) -> str:
+    """阶段④ 逐个执行工具。返回 stop_reason（"" = 本轮正常走完）。
+
+    熔断（REPEAT_FUSE）与断连（client_abort）都在这里判定：
+    两者的收尾方式不同，所以只**上报**原因，收尾留给调用方。
+    """
+    stop_reason = ""
+    for call in calls:
+        name = call["name"]
+        args = call["arguments"] or {}
+
+        # 工具之间也查一次：一次工具调用可能耗时几十秒（生图），
+        # 用户早关页面了就没必要继续下一个
+        if ctx.aborted():
+            stop_reason = "client_abort"
+            obs = {"error": "客户端已断开，停止执行。",
+                   "hint": "这是正常的中止，不是错误。"}
+            logger.info("工具执行中检测到断连，停止 %s", name)
+        else:
+            sig = _signature(name, args)
+            ctx.repeat_counts[sig] = ctx.repeat_counts.get(sig, 0) + 1
+            if ctx.repeat_counts[sig] > REPEAT_FUSE:
+                stop_reason = "repeat_fuse"
+                obs = {
+                    "error": f"你已经用完全相同的参数调用 {name} "
+                             f"{ctx.repeat_counts[sig]} 次，结果不会改变。",
+                    "hint": "请换一组参数，或直接给用户一个结论。",
+                }
+                logger.warning("重复调用熔断：%s", sig[:120])
+            else:
+                ctx.emit("tool_start", name=name, arguments=args)
+                tool_res = dispatch(name, args, ctx.tool_ctx)
+                obs = tool_res.observation
+                if tool_res.terminal:
+                    ctx.forced_final = True
+                ctx.emit(
+                    "tool_end",
+                    name=name,
+                    ok=tool_res.ok,
+                    terminal=tool_res.terminal,
+                    summary=_observation_summary(obs),
+                )
+                # ★ 图一落盘就先把 URL 推给前端（2026-10-05，用户反馈
+                #   "生成成功后回到画布太慢"）。
+                #   此前只有 emit("done") 才带 image_url，而 done 发生在
+                #   **收尾 LLM 调用之后** —— 图其实早就好了，用户却在空白
+                #   画布上多等一整轮 LLM（实测 20~60s，钱也是这次花的）。
+                #   这里在工具成功的瞬间就送一次，前端可以立刻上画布，
+                #   收尾文案照常生成（不省任何质量），只是不再挡在图前面。
+                #   去重：重试同一张图时不会重复推。
+                _img = obs.get("image_url") if isinstance(obs, dict) else None
+                if _img and _img != ctx.emitted_image_url:
+                    ctx.emitted_image_url = _img
+                    ctx.emit("image", url=_img,
+                             size=obs.get("size"), family_id=obs.get("family_id"),
+                             aspect_warning=obs.get("aspect_warning") or "")
+
+        obs_text = _clip_observation(obs, MAX_TOOL_OBSERVATION_CHARS)
+        tool_msg = {
+            "role": "tool",
+            "tool_call_id": call["id"],
+            "content": obs_text,
+        }
+        ctx.messages.append(tool_msg)
+        ctx.result.trace.append(dict(tool_msg))
+        context_store.append_message(
+            ctx.thread_id, "tool", obs_text,
+            tool_call_id=call["id"], tool_name=name,
+        )
+        ctx.result.tool_events.append({
+            "step": step_i,
+            "name": name,
+            "arguments": args,
+            "ok": not bool(obs.get("error")) if isinstance(obs, dict) else True,
+            "observation_chars": len(obs_text),
+        })
+
+        if stop_reason:
+            break
+    return stop_reason
+
+
+def _finalize_repeat_fuse(ctx: LoopCtx) -> None:
+    """熔断收尾：补齐未执行的 tool 回复 → 给一次「只写结论」的机会"""
+    ctx.result.stopped_reason = "repeat_fuse"
+    # 熔断后再给一次「只写结论」的机会，避免把空白留给用户。
+    # 但先补齐未执行的 tool 回复 —— 否则这次请求体不合法，必然 400。
+    filled = _fill_missing_tool_replies(ctx.messages)
+    if filled:
+        logger.info("熔断收尾：补了 %d 条未执行的工具回复", filled)
+    ctx.messages.append({
+        "role": "user",
+        "content": "（系统提示）请停止重复调用，直接用中文给这句任务一个简短结论。",
+    })
+    try:
+        # ★ 2026-10-06：同 forced_final，收尾走快速总结（短超时不换通道）
+        final = summarize_for_final(ctx.messages)
+        ctx.result.reply = (final.get("content") or "").strip() or (
+            "抱歉，这一步我没有得出可用的结论，换个说法或换张图再试试。"
+        )
+    except LLMError as e:
+        ctx.result.reply = _final_fallback_reply(ctx.tool_ctx)
+        logger.warning("熔断收尾文案生成失败：%s", e)
+
+
+def _finalize_step_limit(ctx: LoopCtx) -> None:
+    """步数耗尽收尾：同样先补齐 tool 回复，再强制总结"""
+    ctx.result.stopped_reason = "step_limit"
+    logger.warning("Agent 达到步数上限 %d，强制总结", MAX_AGENT_STEPS)
+    # ★ 与 repeat_fuse 分支对齐（2026-10-06 评审自查）：
+    #   下面这行是**防御性补齐，不是修 bug**。实测（探针：每步返回 2 个
+    #   工具调用、MAX_AGENT_STEPS=2）证明走到 step_limit 时协议必然完整——
+    #   因为设置 stop_reason 的两处（client_abort / repeat_fuse）都会
+    #   `break` 掉外层 for，else 分支根本到不了；能走到这里就说明每个
+    #   tool_call 都已附上 tool 回复。
+    #   那为什么还留着？① 两处收尾条件不同、代码却要各自保证同一件事，
+    #   对称地写一遍比"依赖上游路径恰好如此"更稳；② 将来若在工具循环里
+    #   加任何新的 break 分支，这里就是那个 bug 的护栏。
+    #   （评审自查报告里曾把这条写成"必然 400"的真缺陷，复核后不成立，
+    #     已按实测更正——保留代码，更正说法。）
+    filled = _fill_missing_tool_replies(ctx.messages)
+    if filled:
+        logger.info("步数耗尽收尾：补了 %d 条未执行的工具回复", filled)
+    ctx.messages.append({
+        "role": "user",
+        "content": "（系统提示）已达最大步数，请直接用中文给出简短结论，不要再调用工具。",
+    })
+    try:
+        # ★ 2026-10-06：同上，步数耗尽时的收尾也不再用完整重试档位
+        final = summarize_for_final(ctx.messages)
+        ctx.result.reply = (final.get("content") or "").strip() or (
+            "这一步走了太久，还没得出结果。可以更具体地说说你想要什么效果。"
+        )
+    except LLMError as e:
+        ctx.result.reply = _final_fallback_reply(ctx.tool_ctx)
+        logger.warning("步数耗尽收尾文案生成失败：%s", e)
+
+
+def _finish(ctx: LoopCtx) -> AgentRunResult:
+    """阶段⑤ 收尾：产物快照 → finish 事件 → 回复入库 → 长期记忆 → 审计"""
+    result = ctx.result
+    result.artifacts = dict(ctx.tool_ctx.artifacts)
+    ctx.emit("finish", stopped_reason=result.stopped_reason, steps=result.steps)
+
+    if result.reply:
+        context_store.append_message(ctx.thread_id, "assistant", result.reply)
+
+    if ctx.memory_update and context_store.message_count(ctx.thread_id) >= MEMORY_TRIGGER:
+        _update_long_term(ctx.thread_id)
+
+    audit(
+        "agent_run",
+        thread_id=ctx.thread_id,
+        steps=result.steps,
+        tools=len(result.tool_events),
+        stopped_reason=result.stopped_reason,
+        generated=bool(result.artifacts.get("image_url")),
+    )
+    return result
+
+
 def run(
     user_message: str,
     *,
@@ -204,27 +549,16 @@ def run(
       SSE 场景下客户端一关浏览器，连接就没了，但同步的 worker 还在跑。
       没有这个探针的话，用户关掉页面后 Agent 会继续走完剩余步骤 ——
       该花的钱已经花了，但不该再花后面的。这是"关掉浏览器还在烧钱"的解药。
+
+    ★ 本函数只做**编排**：五个阶段（组装消息 / 调模型 / 解析 tool_calls /
+      执行工具 / 收尾）是下面的模块级函数，跨阶段状态挂在 `LoopCtx` 上。
+      三条护栏（步数 / 观察长度 / 重复熔断）的判定点全部留在本函数与
+      `_execute_tools` 里 —— 护栏在哪生效必须是显式的，不能被阶段拆分稀释。
     """
-
-    def emit(event: str, **payload: Any) -> None:
-        if on_event:
-            try:
-                on_event(event, payload)
-            except Exception as e:                 # 推送失败绝不能拖垮 Agent
-                logger.warning("事件回调失败(%s)：%s", event, e)
-
-    def aborted() -> bool:
-        if should_abort is None:
-            return False
-        try:
-            return bool(should_abort())
-        except Exception:                          # 探针自己出错就当没取消
-            return False
-
-    emit("start", thread_id=thread_id, allow_spend=allow_spend)
-    result = AgentRunResult()
-    # 已经推给前端的图片 URL —— 用于「同一张图只推一次」
-    emitted_image_url: str | None = None
+    ctx = LoopCtx(result=AgentRunResult(), thread_id=thread_id,
+                  on_event=on_event, should_abort=should_abort,
+                  memory_update=memory_update)
+    ctx.emit("start", thread_id=thread_id, allow_spend=allow_spend)
 
     # 契约里声明了但没实现的工具 —— 启动即暴露，不要等到第 8 步才炸
     missing = missing_implementations()
@@ -232,293 +566,59 @@ def run(
         logger.error("工具契约与实现不一致：%s", missing)
         audit("tool_contract_mismatch", missing=missing)
 
-    # ── 能力裁剪：预览模式下计费工具连 Schema 都不给模型看见
-    enabled = set(TOOL_NAMES)
-    if not allow_spend:
-        enabled -= set(SPEND_TOOLS)
-
     with step("Agent 运行", thread=thread_id, allow_spend=allow_spend) as run_ctx:
-        families = compact_families_for_prompt()
-        long_term = context_store.load_long_term(thread_id) if memory_update else {}
-        # ★ 用 history_for_llm 而不是 history：
-        #   后者是「如实呈现库里的内容」，前者额外做 tools 协议配对净化。
-        #   直接喂 history 会在两种正常场景下构造出非法请求体（窗口截断 /
-        #   上一轮提前中止），服务端一律 400 —— 见 context_store.history_for_llm。
-        history = _history_within_budget(thread_id, history_limit)
-
-        system_prompt = build_system_prompt(
-            enabled_tools=enabled,
-            families=families,
-            image_info=image_info,
-            card=card,
-            long_term=long_term,
-        )
-        messages = build_messages(user_message, system_prompt=system_prompt, history=history)
-        result.trace = [dict(m) for m in messages]
-
-        ctx = ToolContext(
-            thread_id=thread_id,
-            quota_key=quota_key or "",
-            image_path=image_path,
-            card=dict(card or {}),
-            image_info=dict(image_info or {}),
-            allow_spend=allow_spend,
-            # 用户自定义提示词：请求级直传，不经模型转述（见 ToolContext 注释）
-            extra_prompt=extra_prompt or "",
-            extra_mode=extra_mode or "append",
-        )
-
-        # 用户消息入库
-        context_store.append_message(thread_id, "user", user_message)
-
-        tools_spec = openai_tools(enabled)
-        repeat_counts: dict[str, int] = {}
-        forced_final = False          # 出图成功后强制模型写总结，不再给工具
+        _prepare(ctx, user_message=user_message, image_path=image_path,
+                 image_info=image_info, card=card, allow_spend=allow_spend,
+                 quota_key=quota_key, extra_prompt=extra_prompt,
+                 extra_mode=extra_mode, history_limit=history_limit,
+                 memory_update=memory_update)
 
         for step_i in range(1, MAX_AGENT_STEPS + 1):
-            result.steps = step_i
+            ctx.result.steps = step_i
 
             # ★ 断连检查放在「每步之前」——这是最经济的粒度：
             #   已经发出的那次 LLM/生图请求没法收回，但下一步可以不做。
-            if aborted():
+            if ctx.aborted():
                 logger.info("客户端已断开，Agent 在第 %d 步提前收尾", step_i)
-                result.stopped_reason = "client_abort"
-                result.reply = "（已中止：客户端断开连接）"
+                ctx.result.stopped_reason = "client_abort"
+                ctx.result.reply = "（已中止：客户端断开连接）"
                 audit("agent_aborted", thread_id=thread_id, step=step_i)
                 break
 
-            emit("step", step=step_i, max_steps=MAX_AGENT_STEPS)
+            ctx.emit("step", step=step_i, max_steps=MAX_AGENT_STEPS)
 
-            try:
-                if forced_final:
-                    # ★ 2026-10-06：出图后的收尾文案改走 summarize_for_final。
-                    #   此前复用 chat_with_tools，继承了主循环的完整容错档位
-                    #   （主通道 60s×2 + 备通道 60s + 退避 ≈ 最坏 2 分 12 秒，
-                    #   实测用户确实卡了 2 分钟）。图已经生成好，这段文案
-                    #   不值这个等待 —— 不换通道、短超时、几乎不重试。
-                    resp = summarize_for_final(messages)
-                else:
-                    resp = chat_with_tools(
-                        messages,
-                        tools=tools_spec,
-                        tool_choice="auto",
-                    )
-            except LLMError as e:
-                # ★ 2026-10-06 修正：收尾失败**不能**报成整轮失败。
-                #   图已经生成落盘了，用户手上就是成品 —— 缺的只是一段说明文字。
-                #   旧代码在此 break 走 llm_error，前端会显示「（模型调用失败）…」，
-                #   用户会以为这趟白跑了、甚至去重做一张。改成给一段兜底文案，
-                #   并明确告诉他图已经好了。
-                if forced_final:
-                    logger.warning("收尾文案生成失败（图已生成，仅缺说明文字）：%s", e)
-                    result.stopped_reason = "final_summary_failed"
-                    result.reply = _final_fallback_reply(ctx)
-                    audit("agent_final_summary_failed",
-                          thread_id=thread_id, error=str(e)[:200])
-                    break
-                logger.error("LLM 调用失败：%s", e)
-                emit("error", stage="llm", message=str(e)[:200])
-                result.stopped_reason = "llm_error"
-                result.reply = f"（模型调用失败）{e}"
-                audit("agent_llm_error", thread_id=thread_id, error=str(e)[:200])
+            resp = _call_model(ctx)
+            if resp is _STOP:                      # LLM 失败已就地收尾
                 break
 
-            for key, val in (resp.get("usage") or {}).items():
-                if isinstance(val, int):
-                    result.usage[key] = result.usage.get(key, 0) + val
-
-            content = resp.get("content") or ""
-            calls = resp.get("tool_calls") or []
-            if content:
-                emit("token", text=content)
-            for call in calls:
-                emit("tool_call", name=call["name"], arguments=call["arguments"])
-
-            # 助手消息入 trajectory（要带 tool_calls 结构，否则下一轮协议不认）
-            assistant_msg: dict[str, Any] = {"role": "assistant"}
-            assistant_msg["content"] = content or None
-            if calls:
-                assistant_msg["tool_calls"] = [
-                    {
-                        "id": c["id"],
-                        "type": "function",
-                        "function": {
-                            "name": c["name"],
-                            "arguments": json.dumps(c["arguments"], ensure_ascii=False),
-                        },
-                    }
-                    for c in calls
-                ]
-            messages.append(assistant_msg)
-            result.trace.append(dict(assistant_msg))
-            if content:
-                context_store.append_message(thread_id, "assistant", content)
-            if calls:
-                context_store.append_message(
-                    thread_id, "assistant", None, meta={"tool_calls": calls}
-                )
+            content, calls = _record_assistant(ctx, resp)
 
             # ── 没有工具调用 = 模型认为可以回答了
             if not calls:
-                result.stopped_reason = "completed"
-                result.reply = content
+                ctx.result.stopped_reason = "completed"
+                ctx.result.reply = content
                 break
 
-            # ── 逐个执行工具
-            stop_reason = ""
-            for call in calls:
-                name = call["name"]
-                args = call["arguments"] or {}
-
-                # 工具之间也查一次：一次工具调用可能耗时几十秒（生图），
-                # 用户早关页面了就没必要继续下一个
-                if aborted():
-                    stop_reason = "client_abort"
-                    obs = {"error": "客户端已断开，停止执行。",
-                           "hint": "这是正常的中止，不是错误。"}
-                    logger.info("工具执行中检测到断连，停止 %s", name)
-                else:
-                    sig = _signature(name, args)
-                    repeat_counts[sig] = repeat_counts.get(sig, 0) + 1
-                    if repeat_counts[sig] > REPEAT_FUSE:
-                        stop_reason = "repeat_fuse"
-                        obs = {
-                            "error": f"你已经用完全相同的参数调用 {name} "
-                                     f"{repeat_counts[sig]} 次，结果不会改变。",
-                            "hint": "请换一组参数，或直接给用户一个结论。",
-                        }
-                        logger.warning("重复调用熔断：%s", sig[:120])
-                    else:
-                        emit("tool_start", name=name, arguments=args)
-                        tool_res = dispatch(name, args, ctx)
-                        obs = tool_res.observation
-                        if tool_res.terminal:
-                            forced_final = True
-                        emit(
-                            "tool_end",
-                            name=name,
-                            ok=tool_res.ok,
-                            terminal=tool_res.terminal,
-                            summary=_observation_summary(obs),
-                        )
-                        # ★ 图一落盘就先把 URL 推给前端（2026-10-05，用户反馈
-                        #   "生成成功后回到画布太慢"）。
-                        #   此前只有 emit("done") 才带 image_url，而 done 发生在
-                        #   **收尾 LLM 调用之后** —— 图其实早就好了，用户却在空白
-                        #   画布上多等一整轮 LLM（实测 20~60s，钱也是这次花的）。
-                        #   这里在工具成功的瞬间就送一次，前端可以立刻上画布，
-                        #   收尾文案照常生成（不省任何质量），只是不再挡在图前面。
-                        #   去重：重试同一张图时不会重复推。
-                        _img = obs.get("image_url") if isinstance(obs, dict) else None
-                        if _img and _img != emitted_image_url:
-                            emitted_image_url = _img
-                            emit("image", url=_img,
-                                 size=obs.get("size"), family_id=obs.get("family_id"),
-                                 aspect_warning=obs.get("aspect_warning") or "")
-
-                obs_text = _clip_observation(obs, MAX_TOOL_OBSERVATION_CHARS)
-                tool_msg = {
-                    "role": "tool",
-                    "tool_call_id": call["id"],
-                    "content": obs_text,
-                }
-                messages.append(tool_msg)
-                result.trace.append(dict(tool_msg))
-                context_store.append_message(
-                    thread_id, "tool", obs_text,
-                    tool_call_id=call["id"], tool_name=name,
-                )
-                result.tool_events.append({
-                    "step": step_i,
-                    "name": name,
-                    "arguments": args,
-                    "ok": not bool(obs.get("error")) if isinstance(obs, dict) else True,
-                    "observation_chars": len(obs_text),
-                })
-
-                if stop_reason:
-                    break
+            stop_reason = _execute_tools(ctx, step_i, calls)
 
             run_ctx["steps"] = step_i
-            run_ctx["tools"] = len(result.tool_events)
+            run_ctx["tools"] = len(ctx.result.tool_events)
 
             # 客户端断连：不再做任何收尾 LLM 调用（那要花钱），直接结束
             if stop_reason == "client_abort":
-                result.stopped_reason = "client_abort"
-                result.reply = "（已中止：客户端断开连接）"
+                ctx.result.stopped_reason = "client_abort"
+                ctx.result.reply = "（已中止：客户端断开连接）"
                 break
 
             if stop_reason == "repeat_fuse":
-                result.stopped_reason = "repeat_fuse"
-                # 熔断后再给一次「只写结论」的机会，避免把空白留给用户。
-                # 但先补齐未执行的 tool 回复 —— 否则这次请求体不合法，必然 400。
-                filled = _fill_missing_tool_replies(messages)
-                if filled:
-                    logger.info("熔断收尾：补了 %d 条未执行的工具回复", filled)
-                messages.append({
-                    "role": "user",
-                    "content": "（系统提示）请停止重复调用，直接用中文给这句任务一个简短结论。",
-                })
-                try:
-                    # ★ 2026-10-06：同 forced_final，收尾走快速总结（短超时不换通道）
-                    final = summarize_for_final(messages)
-                    result.reply = (final.get("content") or "").strip() or (
-                        "抱歉，这一步我没有得出可用的结论，换个说法或换张图再试试。"
-                    )
-                except LLMError as e:
-                    result.reply = _final_fallback_reply(ctx)
-                    logger.warning("熔断收尾文案生成失败：%s", e)
+                _finalize_repeat_fuse(ctx)
                 break
         else:
             # ── 步数耗尽：强制收尾
-            result.stopped_reason = "step_limit"
-            logger.warning("Agent 达到步数上限 %d，强制总结", MAX_AGENT_STEPS)
-            # ★ 与 repeat_fuse 分支对齐（2026-10-06 评审自查）：
-            #   下面这行是**防御性补齐，不是修 bug**。实测（探针：每步返回 2 个
-            #   工具调用、MAX_AGENT_STEPS=2）证明走到 step_limit 时协议必然完整——
-            #   因为设置 stop_reason 的两处（client_abort / repeat_fuse）都会
-            #   `break` 掉外层 for，else 分支根本到不了；能走到这里就说明每个
-            #   tool_call 都已附上 tool 回复。
-            #   那为什么还留着？① 两处收尾条件不同、代码却要各自保证同一件事，
-            #   对称地写一遍比"依赖上游路径恰好如此"更稳；② 将来若在工具循环里
-            #   加任何新的 break 分支，这里就是那个 bug 的护栏。
-            #   （评审自查报告里曾把这条写成"必然 400"的真缺陷，复核后不成立，
-            #     已按实测更正——保留代码，更正说法。）
-            filled = _fill_missing_tool_replies(messages)
-            if filled:
-                logger.info("步数耗尽收尾：补了 %d 条未执行的工具回复", filled)
-            messages.append({
-                "role": "user",
-                "content": "（系统提示）已达最大步数，请直接用中文给出简短结论，不要再调用工具。",
-            })
-            try:
-                # ★ 2026-10-06：同上，步数耗尽时的收尾也不再用完整重试档位
-                final = summarize_for_final(messages)
-                result.reply = (final.get("content") or "").strip() or (
-                    "这一步走了太久，还没得出结果。可以更具体地说说你想要什么效果。"
-                )
-            except LLMError as e:
-                result.reply = _final_fallback_reply(ctx)
-                logger.warning("步数耗尽收尾文案生成失败：%s", e)
+            _finalize_step_limit(ctx)
 
-        result.artifacts = dict(ctx.artifacts)
-        emit("finish", stopped_reason=result.stopped_reason, steps=result.steps)
+        return _finish(ctx)
 
-        if result.reply:
-            context_store.append_message(thread_id, "assistant", result.reply)
-
-        if memory_update and context_store.message_count(thread_id) >= MEMORY_TRIGGER:
-            _update_long_term(thread_id)
-
-        audit(
-            "agent_run",
-            thread_id=thread_id,
-            steps=result.steps,
-            tools=len(result.tool_events),
-            stopped_reason=result.stopped_reason,
-            generated=bool(result.artifacts.get("image_url")),
-        )
-        return result
 
 
 def _fill_missing_tool_replies(messages: list[dict]) -> int:
