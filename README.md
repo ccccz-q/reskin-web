@@ -336,7 +336,7 @@ cd backend
 python tests/run_all.py
 ```
 
-27 个文件**全部通过**，共 **1205 项断言**（20 个文件打印「结果：N 通过」精确计数 =
+29 个文件**全部通过**，共 **1276 项断言**（20 个文件打印「结果：N 通过」精确计数 =
 1025；另 7 个文件不打印汇总行，按通过行数计 = 180），全程离线、零真实 API 调用：
 
 | 文件 | 覆盖 | 数量 |
@@ -359,6 +359,8 @@ python tests/run_all.py
 | `test_repair_http.py` | repair/diagnose HTTP 层：会话隔离 + 落盘结构 + 限速 | 16 |
 | `test_helper_doc.py` | 小助手知识索引：新功能问得到 + 单节不被截断 | 13 |
 | `test_config_boot.py` | 启动期：安全闸门必须永远能跑完（曾 NameError 崩进程）、**API 文档开关的空值语义** | 19 |
+| `test_repair_decision.py` | **Agent 处置决策**：错误分类（修/重编译/重生成/放弃）、**坏输入不崩**、**判据互斥性守卫** | 28 |
+| `test_image_generator_branches.py` | **出图主路径深水区**：尺寸解析/像素下限/画幅优先/错误分类/用户文案/取图 SSRF | 43 |
 | `test_patching.py` | **测试依赖完整性**：AST 钉住 70 处直接 import + 163 处模块属性打桩 | 7 |
 | `test_admin_visibility.py` | 管理员面板：独立身份 + 票据下载 + 软删除（底线：用户仍互相不可见） | 42 |
 | `test_public_isolation.py` | 公开版隔离：无身份不得列举/写入他人图片 | 42 |
@@ -493,7 +495,7 @@ python -c "from services.template_manager import inventory; from tools.registry 
 │   │   ├── routers/       HTTP
 │   │   ├── agents/        门面
 │   │   └── templates/     家族 YAML + 风格模板
-│   └── tests/             自测（run_all.py，27 个文件 / 1205 项断言，全绿）
+│   └── tests/             自测（run_all.py，29 个文件 / 1276 项断言，全绿）
 ├── frontend/
 │   └── src/               App / ParamForm / api
 ├── deploy/                打包与清洗脚本（build_release.py / prepare_public.py）
@@ -514,7 +516,7 @@ python -c "from services.template_manager import inventory; from tools.registry 
 - [x] 参数驱动的动态前端表单
 - [x] SSE 实时工具轨迹
 - [x] 大图灯箱预览（示例图 / 画布成品 / 缩略图共用一套）
-- [x] 自测套件（27 个文件 / 1205 项断言，**全部通过**；行覆盖 70.0%）
+- [x] 自测套件（29 个文件 / 1276 项断言，**全部通过**；行覆盖 70.0%）
 - [x] **CI 三道闸**：自测+覆盖率 / 前端（vitest+build+浏览器冒烟）/ 静态检查（ruff）
 - [x] 独立复审 + 全量修复（5 个 P0、6 个 P1 级问题）
 - [x] **创作卡提取**（本地 Pillow 档 + VLM 档）—— 反推 forbid 自此真正生效

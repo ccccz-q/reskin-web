@@ -48,6 +48,9 @@ from config import (                                          # noqa: E402
 )
 from infra.logging import logger, step                        # noqa: E402
 from services.llm import LLMError, chat, extract_json         # noqa: E402
+# ★ 自修处置决策：让模型判断「该修还是该重做」——
+#   这是本项目里 Agent 承担不可替代判断的位置，详见该模块的docstring。
+from services.repair_decision import classify_and_route     # noqa: E402
 
 
 # ★ 阶段配额：解构最多只能吃掉总预算的一部分，**剩下的必须留给编译**。
@@ -339,10 +342,47 @@ def stage_qc_repair(ctx: ForgeCtx, doc: dict, card: dict,
             doc, errors, report = _finalize_doc(doc, card, preq)
 
     rounds = 0
+    # ★★ Agent 决策：每轮修复前先判断「该用什么方式修」
+    #   为什么这是 Agent 不可替代的位置（详见 services/repair_decision.py）：
+    #   「校验失败」下面藏着性质完全不同的失败 ——
+    #     占位符悬空   → 代码能修
+    #     缺必填条款   → 必须重编译（修补没有意义）
+    #     创意不足     → 该走创意层重生成（修结构是南猿北辙）
+    #   固定顺序重试会把它们当同一件事处理，
+    #   而其中至少两种**怎么重试都不会变好** ——
+    #   等于白白烧调用和时间。
+    #
+    #   边界：决策只**分类**不**动手** —— 动手仍由确定性代码完成，
+    #   避免模型自由改写破坏三段式契约。
+    #   且决策失败会退化为原有重试路径（repair_decision 内部已兜底），
+    #   **Agent 在这里是加速器，不是新的单点故障**。
     while errors and rounds < MAX_REPAIR and not ctx.stop():
         rounds += 1
-        ctx.report(f"校验自修第 {rounds} 轮")
-        logger.info("家族校验未通过，第 %d 次外科自修：%s", rounds, errors[:2])
+        decision = classify_and_route(errors, card=card, doc=doc)
+        act = decision.get("action")
+        ctx.report(f"校验自修第 {rounds} 轮 · 处置={act}")
+        logger.info("家族校验未通过，第 %d 次自修：%s（处置=%s：%s）",
+                    rounds, errors[:2], act, decision.get("reason", "")[:40])
+
+        # give_up：模型判断修不好 —— 立刻停，别烧剩余预算
+        if act == "give_up":
+            logger.info("决策为 give_up（%s），停止自修并如实上报剩余问题",
+                        decision.get("reason", ""))
+            errors = list(errors) + [
+                f"[决策终止] {decision.get('reason', '判定无法修复')}"]
+            break
+
+        # code_repair / normalize：先让确定性代码试（零成本、不惊动模型）
+        if act in ("code_repair", "normalize"):
+            doc2, fixed2 = _resolve_unknown_slots(doc, card or {})
+            if fixed2:
+                logger.info("代码消解了 %d 个占位符（处置=%s），重跑校验",
+                            fixed2, act)
+                doc = doc2
+                doc, errors, report = _finalize_doc(doc, card, preq)
+                continue
+            logger.info("代码兜底未消解任何项（处置=%s），降级为重编译", act)
+
         try:
             repair = chat([
                 {"role": "system", "content": _COMPILE_SYSTEM},
@@ -360,6 +400,11 @@ def stage_qc_repair(ctx: ForgeCtx, doc: dict, card: dict,
                 doc = _normalize(fixed)
                 # 自修产物同样过保护+残留+校验+QC
                 doc, errors, report = _finalize_doc(doc, card, preq)
+                if decision:
+                    report.setdefault("repair_decisions", []).append(
+                        {"round": rounds, "action": act,
+                         "source": decision.get("source"),
+                         "confidence": decision.get("confidence")})
         except LLMError as e:
             logger.warning("自修轮 %d 调用失败：%s", rounds, e)
             break

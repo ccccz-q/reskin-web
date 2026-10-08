@@ -1,86 +1,150 @@
-[
-  {
-    "sample": 1,
-    "src": "test1.png",
-    "group": "A",
-    "label": "无契约",
-    "prompt_len": 34,
-    "ok": true,
-    "elapsed": 168,
-    "out": "s1_A.png",
-    "check": {
-      "per_item": [
-        true,
-        true,
-        true
-      ],
-      "hit": 3,
-      "unknown": 0
+{
+  "family": "拾景纸刊",
+  "family_desc": "真实照片从撕裂的纸边下显露，其余延展为温暖旧纸上的抽象插画场域",
+  "checklist": [
+    "原照片中建筑/主体的位置与轮廓仍然可辨认",
+    "画面呈现旧纸张或印刷品的质感",
+    "画面有明显的风格化处理，而不是原始照片直接呈现"
+  ],
+  "prompt_a": "处理一下这张照片。",
+  "results": [
+    {
+      "sample": 1,
+      "src": "test1.png",
+      "group": "A",
+      "label": "无契约",
+      "prompt_len": 9,
+      "ok": true,
+      "elapsed": 105,
+      "out": "s1_A.png",
+      "check": {
+        "per_item": [
+          true,
+          false,
+          false
+        ],
+        "hit": 1,
+        "unknown": 0
+      },
+      "geometry": {
+        "structure_sim": 0.9792,
+        "verdict": "结构高度保留"
+      }
+    },
+    {
+      "sample": 1,
+      "src": "test1.png",
+      "group": "B",
+      "label": "仅保真段",
+      "prompt_len": 94,
+      "ok": true,
+      "elapsed": 104,
+      "out": "s1_B.png",
+      "check": {
+        "per_item": [
+          true,
+          false,
+          false
+        ],
+        "hit": 1,
+        "unknown": 0
+      },
+      "geometry": {
+        "structure_sim": 0.9893,
+        "verdict": "结构高度保留"
+      }
+    },
+    {
+      "sample": 1,
+      "src": "test1.png",
+      "group": "C",
+      "label": "完整三段式",
+      "prompt_len": 568,
+      "ok": true,
+      "elapsed": 116,
+      "out": "s1_C.png",
+      "check": {
+        "per_item": [
+          true,
+          true,
+          true
+        ],
+        "hit": 3,
+        "unknown": 0
+      },
+      "geometry": {
+        "structure_sim": 0.9559,
+        "verdict": "结构高度保留"
+      }
+    },
+    {
+      "sample": 2,
+      "src": "test2.png",
+      "group": "A",
+      "label": "无契约",
+      "prompt_len": 9,
+      "ok": true,
+      "elapsed": 67,
+      "out": "s2_A.png",
+      "check": {
+        "per_item": [
+          true,
+          false,
+          false
+        ],
+        "hit": 1,
+        "unknown": 0
+      },
+      "geometry": {
+        "structure_sim": 0.9607,
+        "verdict": "结构高度保留"
+      }
+    },
+    {
+      "sample": 2,
+      "src": "test2.png",
+      "group": "B",
+      "label": "仅保真段",
+      "prompt_len": 94,
+      "ok": true,
+      "elapsed": 80,
+      "out": "s2_B.png",
+      "check": {
+        "per_item": [
+          true,
+          false,
+          false
+        ],
+        "hit": 1,
+        "unknown": 0
+      },
+      "geometry": {
+        "structure_sim": 0.9383,
+        "verdict": "结构高度保留"
+      }
+    },
+    {
+      "sample": 2,
+      "src": "test2.png",
+      "group": "C",
+      "label": "完整三段式",
+      "prompt_len": 568,
+      "ok": true,
+      "elapsed": 84,
+      "out": "s2_C.png",
+      "check": {
+        "per_item": [
+          true,
+          true,
+          true
+        ],
+        "hit": 3,
+        "unknown": 0
+      },
+      "geometry": {
+        "structure_sim": 0.921,
+        "verdict": "结构高度保留"
+      }
     }
-  },
-  {
-    "sample": 1,
-    "src": "test1.png",
-    "group": "B",
-    "label": "仅保真段",
-    "prompt_len": 94,
-    "ok": true,
-    "elapsed": 174,
-    "out": "s1_B.png",
-    "check": {
-      "per_item": [
-        true,
-        false,
-        true
-      ],
-      "hit": 2,
-      "unknown": 0
-    }
-  },
-  {
-    "sample": 1,
-    "src": "test1.png",
-    "group": "C",
-    "label": "完整三段式",
-    "prompt_len": 568,
-    "ok": true,
-    "elapsed": 329,
-    "out": "s1_C.png",
-    "check": {
-      "per_item": [
-        true,
-        false,
-        true
-      ],
-      "hit": 2,
-      "unknown": 0
-    }
-  },
-  {
-    "sample": 2,
-    "src": "test2.png",
-    "group": "A",
-    "label": "无契约",
-    "prompt_len": 34,
-    "ok": false,
-    "error": "上游响应超时（这次请求比较重），请稍后再试。"
-  },
-  {
-    "sample": 2,
-    "src": "test2.png",
-    "group": "B",
-    "label": "仅保真段",
-    "prompt_len": 94,
-    "ok": false,
-    "error": "上游响应超时（这次请求比较重），请稍后再试。"
-  },
-  {
-    "sample": 2,
-    "src": "test2.png",
-    "group": "C",
-    "label": "完整三段式",
-    "prompt_len": 568,
-    "ok": false,
-    "error": "上游响应超时（这次请求比较重），请稍后再试。"
-  }
-]
+  ]
+}

@@ -38,6 +38,16 @@ FILES = [
     #   补上它之后立刻抓到一个真 bug —— repair_spec 把 allow_change
     #   归一为列表后**没写回 out**，notes 说"已归一"而值仍是字符串。
     "test_spec_repair.py",
+    # ★ Agent 处置决策（2026-10-09）：工坊主链路上的新逻辑，
+    #   判断「该修还是该重做」。它若抛异常会带崩整次提炼，
+    #   所以除了判得准不准，更要测"坏情况下不崩" + 判据互斥性。
+    "test_repair_decision.py",
+    # ★ 深水区（2026-10-09）：出图主路径的关键分支。
+    #   审查指出 image_generator/style_forge 这两块"真正把项目跑起来"的代码
+    #   覆盖率低于均值。补它立刻抓到真 bug：瞬时错误词表**漏了 500**——
+    #   上游返回 Internal Server Error 时用户直接看到失败，
+    #   而重试一次大概率就好了。
+    "test_image_generator_branches.py",
     # ★ 排在静态清理类测试之后、并发之前：它只读 AST，不发请求，跑得极快，
     #   但能在改动刚落地时就挡住「删掉被测试打桩的导入」这类事故
     #   （2026-10-08 清 F401 时真发生过：删掉 registry.settle_generation

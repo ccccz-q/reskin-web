@@ -387,6 +387,19 @@ def _call_parts(tc: Any) -> tuple[str | None, str | None, str]:
 #   分析类调用超时重试会把等待拖长三倍，保持快速失败哲学。
 _TRANSIENT_HINTS = (
     "502", "503", "504", "429",
+    # ★ 上游 500 / Internal Server Error（2026-10-09 补）：
+    #   词表里原本只有 502/503/504 三个数字，**漏了 500**——
+    #   于是「上游返回 Internal Server Error」被判成确定性失败，
+    #   用户直接看到失败，而重试一次大概率就好了。
+    #   发现方式：test_image_generator_branches.py 测生图错误分类时暴露
+    #   —— 它复用本函数，于是文本通道与生图通道一起漏。
+    #
+    #   ★★ 刻意**不写裸的 "500"**：实测那会误伤
+    #     「5000ms 预算用尽」「剩余 500 次配额」「prompt 长度 5000」
+    #     「image 500x400 不支持」—— 这些都是确定性错误，重试只是白花钱。
+    #   裸数字子串匹配在这里太危险（502/503 同理，只是不常见于额度文案）。
+    #   ⇒ 只认两种确切形态：英文短语与HTTPException 化的类名。
+    "internal server error", "internalservererror",
     "no available", "upstream stream", "bad gateway",
     "service unavailable", "overloaded",
     # ★ 超时纳入重试（实测 2026-10-03：迭代撞上上游拥堵 60s 超时直接报废，
@@ -397,7 +410,10 @@ _TRANSIENT_HINTS = (
     #   这是单条通道抽风的典型症状 —— 换条通道往往立刻就好。
     "emptyupstreamresponse", "空的 choices", "空响应",
 )
-_TRANSIENT_STATUS = frozenset({429, 502, 503, 504})
+# ★ 500 同属瞬时：与 502/503/504 同源（上游临时过载 / 网关内部错）。
+#   ★ 这里用 status_code 而非字符串，所以**不会误伤**
+#   上面那些"额度/尺寸"文案 —— 它们没有 status_code。
+_TRANSIENT_STATUS = frozenset({429, 500, 502, 503, 504})
 
 # ★ 网络层异常：既没有 status_code，文案也不一定能命中上面的关键词
 #   （2026-10-06 补并发/异常测试时才发现的漏判）
