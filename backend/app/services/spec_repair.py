@@ -158,11 +158,19 @@ def repair_spec(spec: dict, card: dict | None = None) -> tuple[dict, list[str]]:
     allow = out.get("allow_change")
     if allow is not None:
         if not isinstance(allow, list):
+            # ★ 2026-10-08 修：这里原来只改了局部变量 `allow`，
+            #   **没有写回 out["allow_change"]**，于是 notes 里写着
+            #   「已归一为列表」而实际值仍是字符串 —— 修复说明与行为不符，
+            #   且下游拿到的仍是错形状。
+            #   发现方式：补tests/test_spec_repair.py 时断言列表失败，
+            #   回查实现才发现。★ 这正是「静态检查有 F 类规则、
+            #   但覆盖率为 0 的文件里连这种低级错误都藏着」的例子。
             allow = [allow] if isinstance(allow, str) else []
             notes.append("allow_change 形状异常，已归一为列表")
         bad = [d for d in allow if str(d) not in ALL_DIMENSIONS]
+        # 一律写回：既覆盖"剔掉未知维度"，也覆盖"只有形状归一"的情形
+        out["allow_change"] = [d for d in allow if str(d) in ALL_DIMENSIONS]
         if bad:
-            out["allow_change"] = [d for d in allow if str(d) in ALL_DIMENSIONS]
             notes.append(f"allow_change 剔除了未知维度 {bad}")
     else:
         out["allow_change"] = ["color", "detail_density", "background"]

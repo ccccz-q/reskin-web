@@ -30,12 +30,23 @@ logs/
 backend/_*.py
 backend/tests/_img_tmp/
 backend/tests/_*.png
-backend/_*.mjs
 backend/*.log
 backend/tests/*.log
 backend/tests/run_all.log
 frontend/.playwright-cli/
 .playwright-cli/
+
+# ★★ _smoke_frontend.mjs 必须入库，例外放行（2026-10-08 修正）
+#   起因：上一行曾写 `backend/_*.mjs`，把浏览器冒烟脚本一起排除了
+#   （git check-ignore 显示命中 `.gitignore:33`）。
+#   后果不是"少个文件"，而是 **CI 的 frontend job 必然失败** ——
+#   脚本不存在，node 报 module not found。
+#   而 README 宣传「CI 三道闸」，有一道是红的话，
+#   26 个测试文件建立起来的信誉全部归零。
+#   ⇒ 教训与 deploy/release* 那条同源：**通配规则会误伤**，
+#     凡是「本该入库的东西」都要显式放行，并且要 git check-ignore 验证。
+#   放行写法：先 `git add -f`，再在此写一条 ! 例外保证后续不被重新排除。
+!backend/_smoke_frontend.mjs
 ux_*.png
 start_*.png
 now.yaml

@@ -119,6 +119,20 @@ jobs:
         #   落并行数据文件后合并。
         run: python backend/tests/cov_run.py 2>&1 | tee backend/tests/cov.log
 
+      - name: 校验 README 数字与实测一致
+        # ★★ 这个 job 存在的最重要理由。
+        #   本项目反复栽在同一件事上：**文档数字与实测不符**——
+        #     · 审查 D1：README 写「CI 是红的」，实际全绿
+        #     · 审查 D2：测试数写低
+        #     · 2026-10-08：断言数写 1018（实为 1150）、覆盖率 68.1%（实为 68.2%）
+        #     · 同一天我改了测试数却忘了更新表格，差 6项。
+        #   根因不是"忘了改"的偶发，而是**缺少校验机制**：
+        #   人肉维护几十个数字，必然漏。
+        #   ⇒ 把「文档里的数字」变成**可自动验证的东西**，
+        #     是对这个项目最大信誉失分来源的直接对抗。
+        #   它会再跑一次自测（约 3-4 分钟），换掉"每次都要人肉核对"。
+        run: python backend/tests/check_readme_numbers.py
+
       - name: 覆盖率摘要存为 artifact
         # README 里写着覆盖率数字，它必须**可复现**而不是一次性的。
         # 把报告与 HTML 一起传上去：HTML 能点开看「哪几行没覆盖」，
@@ -169,9 +183,15 @@ jobs:
     name: 前端（vitest + build + 浏览器冒烟）
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    defaults:
-      run:
-        working-directory: frontend
+    # ★★ 这里**故意不设** defaults.run.working-directory。
+    #   第一版设了 `working-directory: frontend`，然后在run 块里又写
+    #   `cd backend` —— 两者叠加会解析成 `frontend/backend`，
+    #   **该 job 必然失败**。
+    #   而且失败的 CI 比没有 CI 更糟：README 宣传「三道闸」，
+    #   实际有一道是红的，整份材料的可信度归零。
+    #   ⇒ 这里每一处路径都写全，从仓库根显式 cd。
+    #   （也正因如此，冒烟脚本 backend/_smoke_frontend.mjs **必须入库**，
+    #     否则 CI 上找不到它 —— 2026-10-08 独立审查抓到的就是这条。）
 
     steps:
       - name: 检出代码
@@ -185,8 +205,9 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - name: 装依赖
-        # 用 npm ci而不是 npm install：前者严格按 lock 装，
+        # 用 npm ci 而不是 npm install：前者严格按 lock 装，
         # 「本地能过 CI 不能过」这类差异就少了一个来源。
+        working-directory: frontend
         run: npm ci
 
       - name: 前端单测
@@ -194,32 +215,42 @@ jobs:
         #   所以这里**不要**再传 --run：`npm run test -- --run` 会变成
         #   `vitest run --run`。虽然 vitest 容忍，但那是运气不是设计。
         #   也不加 pipefail / tee：vitest 自带退出码，直接用。
+        working-directory: frontend
         run: npm run test
 
       - name: 构建
         # ★ build 也要跑，因为 vitest 只测纯函数——
         #   语法/导入错误它看不见，而 build 能看见。
+        working-directory: frontend
         run: npm run build
 
+      - name: 装 Python
+        # 冒烟要起后端，所以这个 job 也需要 Python。
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: 装后端依赖
+        working-directory: backend
+        run: pip install -r requirements.txt
+
+      - name: 装浏览器（chromium）
+        # ★ 必须装：脚本已改成优先用标准 chromium，装不到才退回 msedge，
+        #   而 CI runner 上既没有 msedge、也没有预装 chromium。
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
       - name: 浏览器冒烟（真实渲染一遍）
-        # ★★ 这一步是上面那次 TDZ 崩溃逼出来的，不可删。
+        # ★★ 这一步是那次 TDZ 崩溃逼出来的，不可删：
         #   单元测试、lint、build 三道防线全部漏掉了它——
-        #   因为它们都不会真的把 <App /> 挂到 DOM 上。
-        #   （脚本已改成可移植：先试标准 chromium，装不到再退回 msedge；
-        #     playwright 导入路径也是动态探测的，本机与 CI 共用一份。）
+        #   因为它们都不会真的把<App /> 挂到 DOM 上。
         run: |
-          # playwright 装在 frontend/ 下，冒烟脚本从 backend/ 调用它，
-          # 所以 NODE_PATH 要指过去（否则脚本里 import 'playwright' 解析失败）
-          export NODE_PATH="$PWD/frontend/node_modules"
-          # ★ 在 frontend/ 下装浏览器二进制，而不是 npx --prefix ——
-          #   playwright 的 CLI 认的是「当前工作目录的 node_modules」，
-          #   --prefix 是 npm 的参数、npx 并不按那个语义解析，
-          #   写上去看着对、实际会找不到浏览器或装到别处。
-          (cd frontend && npx playwright install --with-deps chromium)
-          # 起后端：与 self-test 同一套"key 指向 example.invalid"的口径，
+          set -o pipefail
+          # 起后端：与 self-test 同一套「key 指向 example.invalid」的口径，
           # 保证冒烟不可能真的花钱调生图。
           cd backend
-          pip install -r requirements.txt
           DEEPSEEK_API_KEY=sk-ci-placeholder-not-a-real-key \
           DEEPSEEK_BASE_URL=https://example.invalid/v1 \
           IMAGE_API_KEY=sk-ci-placeholder-not-a-real-key \
@@ -228,23 +259,32 @@ jobs:
           DISABLE_IMAGE_GENERATION=1 \
           PUBLIC_MODE=0 ADMIN_PANEL=0 \
           python -m uvicorn main:app --app-dir app --port 8000 &
-          # 等后端就绪（最多 30 秒）：冒烟脚本不等人，
-          # 硬跑会把"后端还没起来"误报成"页面崩了"
-          for i in $(seq 1 30); do
+          # 等后端就绪（最多 40 秒）：冒烟脚本不等人，
+          # 硬跑会把「后端还没起来」误报成「页面崩了」
+          for i in $(seq 1 40); do
             if curl -sf http://127.0.0.1:8000/api/health >/dev/null 2>&1; then break; fi
             sleep 1
           done
           cd ..
           # vite dev server：PUBLIC_MODE=0 时后端不托管前端产物
           (cd frontend && npm run dev -- --port 5199 --host 127.0.0.1) &
-          for i in $(seq 1 30); do
+          for i in $(seq 1 40); do
             if curl -sf http://127.0.0.1:5199 >/dev/null 2>&1; then break; fi
             sleep 1
           done
+          # playwright 装在 frontend/node_modules，脚本在 backend/ 下跑。
+          # 两条都给：NODE_PATH 让 `import 'playwright'` 能解析，
+          # SMOKE_PLAYWRIGHT_PATH 给一个确定的绝对路径作为兜底
+          #（脚本内部会打印它最终用了哪个来源，便于排查）。
+          export NODE_PATH="$PWD/frontend/node_modules"
+          export SMOKE_PLAYWRIGHT_PATH="$PWD/frontend/node_modules/playwright/index.mjs"
           # 失败时脚本会把截图写进这个目录（见脚本里的 SMOKE_SHOT_DIR）
           SMOKE_SHOT_DIR="$PWD/backend/_smoke_artifacts" \
           node backend/_smoke_frontend.mjs http://127.0.0.1:5199
-        # 冒烟失败要能看到页面截图
+
+      - name: 上传冒烟截图
+        # 失败时才能看到「页面到底长什么样」——
+        # 不然 CI 上只有一句 FAIL 首屏没有崩，排障信息为零。
         if: failure()
         uses: actions/upload-artifact@v4
         with:

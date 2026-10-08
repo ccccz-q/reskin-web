@@ -176,9 +176,21 @@ FRONTEND_DIST = _abs_path("FRONTEND_DIST", PROJECT_ROOT / "frontend" / "dist")
 #     · 长期公网部署 → **默认关**（PUBLIC_MODE=1 时自动关，除非显式打开）。
 #   所以口径是"**默认开、公开模式自动关**"，而不是"默认关"——
 #   后者会让本地开发和线上行为不一致，是另一种坑。
-SERVE_API_DOCS = os.getenv(
-    "SERVE_API_DOCS", "0" if PUBLIC_MODE else "1"
-).strip().lower() in ("1", "true", "yes", "on")
+#
+# ★ 空值的坑（实测踩到，改 `.env.example` 时才发现）：
+#   `os.getenv("X", 默认值)` 只在**变量不存在**时返回默认值。
+#   而 `.env.example` 里写`SERVE_API_DOCS=`（等号后留空）会让变量
+#   **存在但为空串** —— 于是默认不生效，空串被下面的判断算成 False，
+#   本地开发莫名变成"文档关闭"。
+#   这个bug 的隐蔽之处在于：它只在"照着 .env.example 复制一份"时出现，
+#   本机若没这个文件则完全测不到。
+#   ⇒ 所以这里显式处理空串：空 = 跟随 PUBLIC_MODE。
+_docs_raw = os.getenv("SERVE_API_DOCS", "").strip().lower()
+SERVE_API_DOCS = (
+    _docs_raw in ("1", "true", "yes", "on")
+    if _docs_raw
+    else not PUBLIC_MODE          # 没写就跟随 PUBLIC_MODE
+)
 
 _CORS_RAW = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
 CORS_ORIGINS: list[str] = [x.strip() for x in _CORS_RAW.split(",") if x.strip()]

@@ -33,6 +33,11 @@ FILES = [
     "test_helper_doc.py",  # 小助手知识索引：新功能问得到 + 单节不被截断
     "test_governance.py",
     "test_config_boot.py",   # 启动期：安全闸门必须永远能跑完（曾 NameError 崩进程）
+    # ★ spec_repair 的覆盖率曾是 0.0%（2026-10-08 独立审查指出）：
+    #   它是「装得进去、用起来才炸」的最后一道闸，170 行没有一行被测到。
+    #   补上它之后立刻抓到一个真 bug —— repair_spec 把 allow_change
+    #   归一为列表后**没写回 out**，notes 说"已归一"而值仍是字符串。
+    "test_spec_repair.py",
     # ★ 排在静态清理类测试之后、并发之前：它只读 AST，不发请求，跑得极快，
     #   但能在改动刚落地时就挡住「删掉被测试打桩的导入」这类事故
     #   （2026-10-08 清 F401 时真发生过：删掉 registry.settle_generation

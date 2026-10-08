@@ -119,6 +119,57 @@ rc, out = boot()
 check("换cwd 后 STORAGE_DIR 仍是绝对路径", rc == 0 and "STORAGE= True" in out,
       out[:130])
 
+# ── SERVE_API_DOCS 的空值处理（2026-10-08）─────────────────────
+# ★ 为什么专门测这个：
+#   `os.getenv("X", 默认值)` 只在变量**不存在**时返回默认值；
+#   而 `.env.example` 里写 `SERVE_API_DOCS=`（等号后留空）会让变量
+#   存在但为空串 —— 默认值不生效，空串被算成False，
+#   于是**本地开发莫名变成"文档关闭"**。
+#   这个 bug 的隐蔽之处：只在"照着 .env.example 复制一份"时出现，
+#   本机没那个文件就完全测不到。
+#   而 `.env.example` 里那一行正是我自己写的—— 于是自己埋了坑自己踩。
+print("\n[测试 14] API 文档开关的空值语义")
+_SERVE_PROBE = (
+    "import sys; sys.path.insert(0, r'app');"
+    "from config import SERVE_API_DOCS;"
+    "print('True' if SERVE_API_DOCS else 'False')"
+)
+
+
+def _docs_flag(docs: str, public_mode: str) -> str:
+    """在干净的子进程里跑一次，读回 SERVE_API_DOCS 的实际值。"""
+    import os as _os
+    import subprocess as _sp
+    env = dict(_os.environ)
+    env["SERVE_API_DOCS"] = docs
+    env["PUBLIC_MODE"] = public_mode
+    env.setdefault("IMAGE_BACKEND", "openai")
+    env.setdefault("IMAGE_API_KEY", "placeholder")
+    env.setdefault("LLM_API_KEY", "placeholder")
+    backend = str(Path(__file__).resolve().parents[1])          # → backend/
+    r = _sp.run([sys.executable, "-c", _SERVE_PROBE],
+                capture_output=True, text=True, env=env, cwd=backend)
+    if r.returncode != 0:
+        # ★ 探针失败时把 stderr 带出来：第一次写这函数时用了 r'app'
+        #   这种相对路径 + 错误的 cwd，6 项全 ERR 而看不出原因。
+        #   「静默的统一失败」比报错难查—— 至少要能说清失败在哪。
+        return "ERR:" + (r.stderr or "").strip().splitlines()[-1][:60]
+    return (r.stdout or "").strip().splitlines()[-1] if r.stdout else "ERR:空输出"
+
+
+# 期望矩阵：空值跟随 PUBLIC_MODE；显式 0/1 无条件覆盖
+for _docs, _pm, _want in [
+    ("", "0", "True"),    # ★ 这条就是修复前会挂的那条
+    ("0", "0", "False"),
+    ("1", "0", "True"),
+    ("", "1", "False"),
+    ("0", "1", "False"),
+    ("1", "1", "True"),
+]:
+    _got = _docs_flag(_docs, _pm)
+    check(f"SERVE_API_DOCS={_docs!r} + PUBLIC_MODE={_pm} → {_want}",
+          _got == _want, f"实际 {_got!r}")
+
 print()
 print(f"结果：{PASS} 通过 / {FAIL} 失败")
 sys.exit(1 if FAIL else 0)
