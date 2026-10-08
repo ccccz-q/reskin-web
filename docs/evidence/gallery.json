@@ -1,0 +1,106 @@
+{
+  "_note": "★ 从磁盘实物重建。首次跑完 8/8，改家族列表后补跑 4 张；gallery.json 被后一次覆盖成 4/8，但图全在磁盘上（11 张）。凡未落盘的组合一律不记为成功。",
+  "model": "gpt-image-2",
+  "total_ok": 11,
+  "results": [
+    {
+      "sample": 1,
+      "src": "test1.png",
+      "family": "full_restyle",
+      "label": "整体重绘",
+      "ok": true,
+      "out": "1_full_restyle.png",
+      "size": "2758KB"
+    },
+    {
+      "sample": 1,
+      "src": "test1.png",
+      "family": "material_pixel",
+      "label": "材料章印",
+      "ok": true,
+      "out": "1_material_pixel.png",
+      "size": "2578KB"
+    },
+    {
+      "sample": 1,
+      "src": "test1.png",
+      "family": "risograph_travel_print",
+      "label": "Riso 旅行版画",
+      "ok": true,
+      "out": "1_risograph_travel_print.png",
+      "size": "3577KB"
+    },
+    {
+      "sample": 1,
+      "src": "test1.png",
+      "family": "second_world",
+      "label": "第二世界",
+      "ok": true,
+      "out": "1_second_world.png",
+      "size": "2673KB"
+    },
+    {
+      "sample": 1,
+      "src": "test1.png",
+      "family": "voxel_path_reflection",
+      "label": "体素林径",
+      "ok": true,
+      "out": "1_voxel_path_reflection.png",
+      "size": "2668KB"
+    },
+    {
+      "sample": 1,
+      "src": "test1.png",
+      "family": "zine",
+      "label": "拾景纸刊",
+      "ok": true,
+      "out": "1_zine.png",
+      "size": "2773KB"
+    },
+    {
+      "sample": 2,
+      "src": "test2.png",
+      "family": "full_restyle",
+      "label": "整体重绘",
+      "ok": true,
+      "out": "2_full_restyle.png",
+      "size": "2361KB"
+    },
+    {
+      "sample": 2,
+      "src": "test2.png",
+      "family": "material_pixel",
+      "label": "材料章印",
+      "ok": true,
+      "out": "2_material_pixel.png",
+      "size": "2400KB"
+    },
+    {
+      "sample": 2,
+      "src": "test2.png",
+      "family": "risograph_travel_print",
+      "label": "Riso 旅行版画",
+      "ok": true,
+      "out": "2_risograph_travel_print.png",
+      "size": "3520KB"
+    },
+    {
+      "sample": 2,
+      "src": "test2.png",
+      "family": "second_world",
+      "label": "第二世界",
+      "ok": true,
+      "out": "2_second_world.png",
+      "size": "2023KB"
+    },
+    {
+      "sample": 2,
+      "src": "test2.png",
+      "family": "voxel_path_reflection",
+      "label": "体素林径",
+      "ok": true,
+      "out": "2_voxel_path_reflection.png",
+      "size": "2653KB"
+    }
+  ]
+}

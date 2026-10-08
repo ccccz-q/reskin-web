@@ -94,3 +94,12 @@ backend/_smoke_artifacts/
 # 它只有2 字节但会被当成"要提交的新文件"，容易误入。
 .push_payload.json
 backend/_cov_html/
+
+# ── 效果证据的原始产物（2026-10-08）──────────────────────
+# docs/gallery/*.png 是生成物，单张 2-3MB、11 张共 22MB。
+# 入库的是 docs/compare/*.webp（约 150KB，两组对比 + 一组消融），
+# 原始 PNG 可由 `python tests/evidence_run.py` 重新跑出来。
+# 判断依据是「能不能再生」：能再生的就不入库 —— 与 deploy/public_storage 同一条标准。
+docs/gallery/
+docs/gallery_webp/
+docs/evidence/ablation/
