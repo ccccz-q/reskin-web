@@ -27,14 +27,12 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Any
 
 # 导入根是 backend/app（与项目原有风格一致：main.py 写 from routers.image import ...，
 # config 也是顶层模块）。单独 python xxx.py 运行时需补上这个根。
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from infra.logging import new_trace_id, step                    # noqa: E402
 from services.family_renderer import (                           # noqa: E402
     FamilyRenderError,
     render_family,

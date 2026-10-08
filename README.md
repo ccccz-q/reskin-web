@@ -258,40 +258,69 @@ cd backend
 python tests/run_all.py
 ```
 
-25 个文件**全部通过**，共 **957 项断言**（另 4 个文件按「通过 N 项」计数，不并入断言口径），全程离线、零真实 API 调用：
+26 个文件**全部通过**，共 **1018 项断言**（另 7 个文件按「通过 N 项」计数，不并入断言口径），全程离线、零真实 API 调用：
 
 | 文件 | 覆盖 | 数量 |
 |---|---|---|
 | `test_llm_resilience.py` | 通道容错：上游「假装成功」时空响应 → 重试换通道 | 101 |
 | `test_api_smoke.py` | HTTP 端到端：健康、家族、上传攻击、路径穿越、注入拦截、坏 YAML 隔离、SSE、审计 | 88 |
-| `test_forge.py` | 工坊：草稿提炼、修订、安装为家族、模板库、**参考图越权校验**、阶段预算闸、形状容错 | 148 |
+| `test_forge.py` | 工坊：草稿提炼、修订、安装为家族、模板库、**参考图越权校验**、阶段预算闸、形状容错、**模型自造槽位消解** | 154 |
 | `test_security.py` | Origin 白名单/重复头、令牌模式、**extract_card 预览降级**、**SSE 断连全链路（1 次 vs 9 次模型调用）**、许可回收 | 57 |
 | `test_agent_loop.py` | 正常路径、Schema 校验、重复熔断、步数护栏、观察截断、预览模式、降级、**上下文 token 预算双闸**、护栏常量口径 | 85 |
-| `test_renderer.py` | 反推 forbid 两道过滤、占位符三个坑、冲突检测 | 55 |
 | `test_identity.py` | 访客码 / 绑定 / 登录、会话隔离、数据库懒建表 | 62 |
 | `test_preflight.py` | 编译后漂移自检 + 核心规则按相关性选择 | 60 |
+| `test_renderer.py` | 反推 forbid 两道过滤、占位符三个坑、冲突检测 | 55 |
 | `test_image_gen.py` | 生图：画幅只三档（表达不了就跟随原图）+ 重试计划 | 46 |
-| `test_public_isolation.py` | 公开版隔离：无身份不得列举/写入他人图片 | 42 |
-| `test_card.py` | 创作卡提取：色名映射、本地档、三级分级、提示词真的被改变、异常路径、缓存 | 42 |
 | `test_concurrency.py` | 线程并发不超卖、损坏的 SQLite 文件、**磁盘满/只读/目录被删**、**多 worker 自检**、上游网络层异常 | 44 |
-| `test_governance.py` | 额度预扣/冲正、**票据一次性兑现、崩溃后不泄漏额度**、配额耗尽、会话隔离 | 36 |
 | `test_context_store.py` | SQLite 读写、双路召回、分词器迁移、索引自愈、**历史回放的 tools 协议配对** | 40 |
+| `test_governance.py` | 额度预扣/冲正、**票据一次性兑现、崩溃后不泄漏额度**、配额耗尽、会话隔离 | 36 |
+| `test_repair.py` | repair_image 局部修复：上一版成品为参考图 + CHANGE ONLY 外科指令 | 27 |
+| `test_drift.py` | 漂移诊断（repair v1）：解析健壮性 + 降级路径 | 24 |
+| `test_repair_http.py` | repair/diagnose HTTP 层：会话隔离 + 落盘结构 + 限速 | 16 |
+| `test_helper_doc.py` | 小助手知识索引：新功能问得到 + 单节不被截断 | 13 |
+| `test_config_boot.py` | 启动期：安全闸门必须永远能跑完（曾 NameError 崩进程） | 13 |
+| `test_patching.py` | **测试依赖完整性**：AST 钉住 70 处直接 import + 163 处模块属性打桩 | 7 |
 | `test_admin_visibility.py` | 管理员面板：独立身份 + 票据下载 + 软删除（底线：用户仍互相不可见） | 42 |
+| `test_public_isolation.py` | 公开版隔离：无身份不得列举/写入他人图片 | 42 |
 | `test_image_payload.py` | 回图形态：上游改回 url 也能认（+ 取图 SSRF 两套判据） | 27 |
 | `test_error_taxonomy.py` | 错误分诊：网关「假 400」要重试，原文不得直出用户 | 26 |
-| `test_repair.py` | repair_image 局部修复：上一版成品为参考图 + CHANGE ONLY 外科指令 | 25 |
-| `test_drift.py` | 漂移诊断（repair v1）：解析健壮性 + 降级路径 | 24 |
 | `test_async_chat.py` | 后台任务八条护栏（云端 60 秒网关的解法） | 22 |
-| `test_repair_http.py` | repair/diagnose HTTP 层：会话隔离 + 落盘结构 + 限速 | 16 |
 | `test_mobile_upload.py` | 手机相册 MPO 动态照片 + 出图回填时机 | 14 |
-| `test_config_boot.py` | 启动期：安全闸门必须永远能跑完（曾 NameError 崩进程） | 13 |
-| `test_helper_doc.py` | 小助手知识索引：新功能问得到 + 单节不被截断 | 13 |
 | `test_db_persistence.py` | 数据持久性：WAL 会丢数据 → 必须 DELETE（线上事故固化） | 7 |
+| `test_card.py` | 创作卡提取：色名映射、本地档、三级分级、提示词真的被改变、异常路径、缓存 | 42 |
 
 > 数法（可自行复核）：`run_all.py` 只信退出码、不解析输出，所以上表是
 > **逐个文件单独跑**、数各自打印的通过/失败行得到的，不是估的。
 > 注意各文件输出格式不统一（`OK` / `✓` / `✅` 三种都有），
-> 且有 7 个文件不打印「结果：N 通过」汇总行。
+> 且有 7 个文件不打印「结果：N 通过」汇总行（表中数量取其通过行数）。
+
+### 覆盖率
+
+```bat
+cd backend
+python tests/cov_run.py
+```
+
+**行覆盖 68.1%、分支覆盖 61.4%**（1791/2918 分支命中；26 个文件全跑通后合并实测）。
+
+> ★ 口径说明（这点容易写错，故写在文档里）：
+> **不能**用 `coverage run tests/run_all.py` —— `run_all.py` 用 subprocess
+> 逐个跑测试文件，而 coverage 默认只测量自己那一个进程，
+> 那样跑出来是 **0.0%**。一个明显失真的数字比没有数字更坏，
+> 所以 `cov_run.py` 让每个测试文件各自在 coverage 下运行、再合并。
+
+**低覆盖的地方如实列出**（不藏）：
+
+| 位置 | 覆盖 | 原因 |
+|---|---|---|
+| `routers/forge.py` | 22.3% | 工坊链路走真实模型，端到端由 `tests/e2e_live.py` 覆盖（不进单元套件，因为要花钱且耗时数分钟） |
+| `routers/auth.py` | 40.3% | 登录限流是按「每分钟计数」，需要等真实时间流逝才能触发 |
+| `infra/logging.py` | 49.0% | 结构化日志的异常分支（`json.dumps` 遇到不可序列化对象）需要构造畸形对象 |
+
+这三处不是"忘了测"，是**测试代价与收益不匹配**：
+补它们要引入真实时间等待或真实模型调用，
+换来的却是对已经很明确的分支的重复验证。
+
 >
 另有一个家族 YAML 契约自检（等价于启动时的 preflight，`start.bat` 第 4 步跑的就是它）：
 
@@ -365,7 +394,7 @@ python -c "from services.template_manager import inventory; from tools.registry 
 │   │   ├── routers/       HTTP
 │   │   ├── agents/        门面
 │   │   └── templates/     家族 YAML + 风格模板
-│   └── tests/             自测（run_all.py，25 个文件 / 957 项断言，全绿）
+│   └── tests/             自测（run_all.py，26 个文件 / 1018 项断言，全绿）
 ├── frontend/
 │   └── src/               App / ParamForm / api
 ├── deploy/                打包与清洗脚本（build_release.py / prepare_public.py）
@@ -385,14 +414,16 @@ python -c "from services.template_manager import inventory; from tools.registry 
 - [x] 治理：配额 / 总开关 / 路径白名单 / 审计
 - [x] 参数驱动的动态前端表单
 - [x] SSE 实时工具轨迹
-- [x] 原图 / 成品对比视图
-- [x] 自测套件（25 个文件 / 957 项断言，**全部通过**）
+- [x] 大图灯箱预览（示例图 / 画布成品 / 缩略图共用一套）
+- [x] 自测套件（26 个文件 / 1018 项断言，**全部通过**；行覆盖 68.1%）
+- [x] **CI 三道闸**：自测+覆盖率 / 前端（vitest+build+浏览器冒烟）/ 静态检查（ruff）
 - [x] 独立复审 + 全量修复（5 个 P0、6 个 P1 级问题）
 - [x] **创作卡提取**（本地 Pillow 档 + VLM 档）—— 反推 forbid 自此真正生效
 - [x] **访问控制**：写操作 Origin 白名单（默认）+ 本地令牌（可选）
 - [x] **SSE 资源护栏**：并发上限 + 断连即停止
-- [x] 无用文件清理（808MB → 63MB）
+- [x] 无用文件清理（曾因49MB 图片入库把 `.git` 撑大，已`git rm --cached` 移出索引；现`.git` 51MB）
 - [x] 第二轮独立复审 + 全量修复（2 个 P0、5 个 P1）
+- [x] 第三轮独立复审 + 全量修复（含 1 个会炸真实链路的越权 S1、4 项文档失真）
 
 ## 已知限制
 

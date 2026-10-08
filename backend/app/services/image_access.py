@@ -27,7 +27,6 @@
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 # 公共资源目录：所有访客都能看

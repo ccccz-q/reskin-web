@@ -46,9 +46,7 @@ import json
 import os
 import re
 import sys
-import uuid
 from functools import lru_cache
-from typing import Any
 
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -82,7 +80,6 @@ from concurrent.futures import ThreadPoolExecutor  # noqa: E402
 from config import (  # noqa: E402
     ANALYZE_TIMEOUT_SEC,
     FORGE_COMPILE_TIMEOUT_SEC,
-    FORGE_REPAIR_TIMEOUT_SEC,
     FORGE_TOTAL_BUDGET_SEC,
     FORGE_VLM_TIMEOUT_SEC,
     FORGE_DECODE_WORKERS,
@@ -103,14 +100,12 @@ MAX_REPAIR = 1
 # ══════════════════ ① 角色分配（多图时）══════════════════
 
 
-
 # ══════════════════ ② 单图解构 ═══════════════════
 
 _DECODE_SYSTEM = _load_prompt("forge_decode.md")   # 外置资产：templates/prompts/forge_decode.md
 
 
 # ══════════════════ ③ 多图合成视觉卡 ═══════════════════
-
 
 
 # ══════════════════ ④ 编译为家族 ═══════════════════
@@ -887,7 +882,6 @@ def forge(
         errors=errors, report=report, warnings=warnings, rounds=rounds,
         decode_sec=decode_sec, intent_calls=intent_calls,
     )
-
 
 
 def revise(spec: dict, feedback: str, theory: str = "",

@@ -389,7 +389,6 @@ def build_visual_card(card: dict) -> dict:
     ratios = [c.get("ratio") for c in palette if c.get("ratio")]
     orient = card.get("orientation")
     light = card.get("light_hint")
-    subject = card.get("subject")
     anchors = [a.get("desc") for a in (card.get("anchors") or [])
                if isinstance(a, dict) and a.get("desc")]
     # ★ risk_notes 在提取卡里是**字符串**（notes[:80]），不是 list ——

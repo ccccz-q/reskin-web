@@ -44,11 +44,10 @@ surreal_collage 声明的参数叫 flat_shapes，段里引用的占位符却是 
 """
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 import re
-from typing import Any, Callable
+from typing import Any
 
 import yaml
 
@@ -660,7 +659,6 @@ def _bridge_missing_desc(family: dict, values: dict) -> list[str]:
             values[ph] = str(values[base])
             bridged.append(ph)
     return bridged
-
 
 
 # ─────────────────── 文本清理（已拆至 prompt_cleanup.py）───────────────────

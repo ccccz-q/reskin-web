@@ -1,0 +1,48 @@
+# ═══════════════════════════════════════════════════════════
+# coverage 配置
+#
+# ★ 踩过的坑：coverage 的配置是 **INI**，INI 不支持行尾注释（`key = v # 注释`）。
+#   我第一版每行都写了行尾注释，结果报
+#     Not a boolean: True # 分支覆盖：漏掉的 else 比漏掉的 else 更致命
+#   —— 整份配置直接读不进去。INI 里注释必须**独占一行**。
+#   （这和 .gitignore / package.json 的规则都不一样，容易凭直觉写错。）
+#
+# ★ 为什么 measure 只统计 app/、还 omit 掉 tests：
+#   把测试文件算进分母，覆盖率会凭空高一截 —— 那是「测试代码被测试代码执行到」
+#   的自我循环，不含任何信息。分母里出现 tests/ 的数字一律是口径失真。
+#
+# ★ 为什么 omit 掉 routers/admin.py：
+#   管理后台只存在于私库，公开版没有这个文件。带着它统计，
+#   同一份配置在两库跑会得到**不同的分母**，
+#   于是「覆盖率数字」在两库之间不可比 —— 而 README 只会写一个数字。
+#═══════════════════════════════════════════════════════════
+
+[run]
+#分支覆盖：漏掉的 else 比漏掉的行更常见也更致命
+branch = True
+source = app
+omit =
+    */tests/*
+    */__pycache__/*
+    */app/routers/admin.py
+parallel = False
+
+[report]
+precision = 1
+show_missing = True
+skip_covered = False
+exclude_lines =
+    pragma: no cover
+    if TYPE_CHECKING:
+    raise NotImplementedError
+# ★ 刻意不 exclude 「except Exception:」整块。
+#   想过用 exclude_lines 把所有降级 except 排除，让数字好看 ——
+#   但那是把「这段降级逻辑从没被执行过」这个真实信息抹掉，换来的高覆盖率是假的。
+#   兜底分支该不该被测，要靠 test_concurrency / weaknet 单独覆盖，
+#   并在该文件的报告里体现为「这几行没覆盖」，而不是「不算分母」。
+#   （另注意：exclude_lines 的值区域里**不能夹散文行**，
+#     INI 会把整行当成本项的值 —— 与行尾注释是同一种错误。）
+
+[html]
+directory = ../docs/coverage
+title = 换颜 Reskin · 后端覆盖率

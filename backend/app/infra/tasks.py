@@ -333,7 +333,7 @@ def submit(*, name: str, kind: str, owner: str,
         with _LOCK:
             _TASKS.pop(task_id, None)
         logger.exception("任务线程启动失败 %s", task_id)
-        raise TaskBusy("服务暂时无法启动新任务，请稍后再试")
+        raise TaskBusy("服务暂时无法启动新任务，请稍后再试") from None
     return task_id
 
 

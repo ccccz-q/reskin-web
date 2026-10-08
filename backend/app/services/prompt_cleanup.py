@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 # ★ 拼接伪影清洗（实测 2026-10-03）：dicts 描述本身是完整句（"采用竖向画面…"），
 #   插进"采用{x_desc}…"的句式模板后叠成「采用采用竖向画面」「使用使用轻微景深」

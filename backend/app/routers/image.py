@@ -28,7 +28,6 @@ import sys
 import threading
 from pathlib import Path
 from datetime import datetime
-from typing import Any
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, Response
 from fastapi.concurrency import run_in_threadpool
@@ -40,18 +39,14 @@ if __package__ in (None, ""):
 from agents.image_agent import (                                      # noqa: E402
     AgentInputError,
     normalize_reference,
-    resolve_thread_id,
 )
 from config import ConfigMissing, IMAGE_STORAGE_DIR                  # noqa: E402
 from governance.guard import (                                       # noqa: E402
     GovernanceError,
     new_generation_guard,
-    release_generation,
-    remaining_quota,
     reserve_generation,
-    settle_generation,
 )
-from infra.logging import audit, logger, step                           # noqa: E402
+from infra.logging import (audit, logger)
 from infra.storage import (                                       # noqa: E402
     is_retired_seed,
     retired_seed_names,
@@ -673,10 +668,8 @@ async def gallery(limit: int = 24, kinds: str = "", force: bool = False,
       是仓库打开慢的第一半）。前端「生成完成后对账」必须带 force=true，
       否则刚落盘的新图会被缓存挡住，对账就白做了。
     """
-    import threading as _threading
     import time as _time
 
-    now = _time.monotonic()
     bucket = _gallery_cache.setdefault(sid, {"ts": 0.0, "data": None})
     # ★ 桶数上限（审查 P2-3）：此前按会话分桶但永不淘汰 —— 公开版每个匿名
     #   访客永久占一格内存（桶里还挂着最多 500 条 items）。到这里说明来了新访客，

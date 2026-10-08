@@ -18,7 +18,6 @@ from __future__ import annotations
 import errno
 import json
 import os
-import re
 import socket
 import sys
 import time
@@ -96,7 +95,6 @@ if not (DEEPSEEK_API_KEY or PREMIUM_API_KEY):
 
 class LLMError(Exception):
     """LLM 调用失败 —— 携带原始错误类型，便于区分网络 / 鉴权 / 超长"""
-
 
 
 # ════════════ 通道（Channel）════════════

@@ -33,8 +33,16 @@ from contracts.tools import (                                        # noqa: E40
 from governance.guard import (                                        # noqa: E402
     GovernanceError,
     new_generation_guard,
-    release_generation,
     reserve_generation,
+    # ★★ 下面两个是**测试打桩入口**，不是无用导入，**别删**（已实测删掉会红）。
+    #   tests/test_repair.py:99/102/176 直接写 `reg.settle_generation = lambda...`
+    #   来替换归还逻辑 —— 它测的是「恰好归还过一次、且结果回传给模型」，
+    #   属于**行为断言**，不是锁实现细节。
+    #   我在2026-10-08 清 F401 时把它们删了，test_repair立刻报
+    #   AttributeError: module 'tools.registry' has no attribute 'settle_generation'。
+    #   → 教训：ruff 把 re-export 判成「未使用」，因为它只看向量本文件的使用。
+    #     但测试是通过 `模块.名字` 访问的，这在 ruff 眼里"看不见"。
+    release_generation,
     settle_generation,
 )
 from infra.logging import audit, logger, step                          # noqa: E402

@@ -56,14 +56,14 @@ print("=== 1. Origin 白名单：模拟恶意网页 ===")
 GOOD = "http://localhost:5173"
 BAD = "https://evil.com"
 
-r = client.post(f"/api/chat/reset-quota?thread_id=t", headers={"Origin": GOOD, "X-Session-Id": "a1a1a1a1bbbb4cccc8ddd4eeee5ffff6"})
+r = client.post("/api/chat/reset-quota?thread_id=t", headers={"Origin": GOOD, "X-Session-Id": "a1a1a1a1bbbb4cccc8ddd4eeee5ffff6"})
 check("白名单内的来源放行", r.status_code == 200, str(r.status_code))
 
-r = client.post(f"/api/chat/reset-quota?thread_id=t", headers={"Origin": BAD, "X-Session-Id": "b1b1b1b1bbbb4cccc8ddd4eeee5ffff6"})
+r = client.post("/api/chat/reset-quota?thread_id=t", headers={"Origin": BAD, "X-Session-Id": "b1b1b1b1bbbb4cccc8ddd4eeee5ffff6"})
 check("★ 恶意网页被挡 403", r.status_code == 403, str(r.status_code))
 check("给的是结构化错误码", r.json().get("code") == "origin_denied", str(r.json())[:90])
 
-r = client.post(f"/api/chat/reset-quota?thread_id=t")
+r = client.post("/api/chat/reset-quota?thread_id=t")
 check("无 Origin（curl/本地脚本）放行", r.status_code == 200, str(r.status_code))
 
 # 这个正是旧版最容易被利用的形态：简单请求、不触发预检

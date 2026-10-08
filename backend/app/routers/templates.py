@@ -34,7 +34,6 @@ from services.template_manager import (                          # noqa: E402
     TemplateError,
     clear_cache,
     get_family_by_id,
-    get_template_by_id,
     inventory,
     load_families,
     load_templates,

@@ -33,7 +33,6 @@ from config import (                                    # noqa: E402
 # 按通道配置取用（见 llm.py 顶部「通道」一节），本文件不再重复接线。
 from infra.logging import audit, logger                 # noqa: E402
 from services.llm import (                              # noqa: E402
-    chat,
     chat_interactive,
     extract_json,
 )   # ★ extract_json 在 llm 里

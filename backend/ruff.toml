@@ -1,0 +1,118 @@
+# ═══════════════════════════════════════════════════════════
+# ruff —— 后端静态检查配置
+#
+# 为什么只选这几条规则（★ 不是"能查多少查多少"）：
+#   上一轮我跑 `ruff check --select ALL` 的念头是"查全一点更保险"，
+#   但那会拉进来几十条纯风格规则（行宽、命名法、docstring 格式），
+#   在一个**注释密度极高**的项目里立刻变成几百条噪声。
+#   噪声的真正代价不是刷屏，而是让人养成忽略警告的习惯——
+#   和我在计划书 O5 里批评"为了消 lint 警告而加 useCallback"是同一件事。
+#
+#   所以这里的原则：**只查会掩盖真缺陷的那几类**。
+#     E9  语法错误 / 缩进错乱
+#     F   逻辑级：未定义名、重复定义、未用变量、未用导入、f-string 没占位符
+#     B   bugbear：except 里裸raise、循环变量没用、zip 长度不匹配
+#   这三类的共同点：**它们出现时，代码一定已经错了**。
+# ═══════════════════════════════════════════════════════════
+
+[lint]
+select = ["E9", "F", "B"]
+ignore = [
+    # B008：函数默认值里调函数是 FastAPI 的正常写法
+    #（Depends()/Query() 就是靠这个声明注入的），不是 bug。
+    "B008",
+
+    # ★ B007（4 处）：循环变量没在循环体里用到。
+    #   这是**刻意的**，不是漏眼：
+    #   `for i in range(n): do_something(i)` 里的 i 只用于表达「第几次」，
+    #   改写成 `for _ in range(n)` 反而把「第几次」这个语义信息擦掉了。
+    #   而本项目大量用 `for i in range(n)` 配合 enumerate 之外的分片逻辑。
+    #   强行改会引入"看起来更干净但更难读"的 diff，收益为负。
+    "B007",
+
+    # ★ B905（3 处）：zip() 没写 strict=。
+    #   ★ 这条**明确不修**，因为它是行为变更而不是风格建议：
+    #     加上 strict=True 后，两个序列长度不等会**抛 ValueError**。
+    #     在这个项目里，被zip 的两个序列都是「同一批数据的两份投影」，
+    #     长度不等本身就说明上游有 bug —— 那时**应该报错而不是静默截断**。
+    #     但要加就得连同调用点的错误语义一起设计，
+    #     属于「需要单独一轮验证」的改动，不该混进收尾批次。
+    #     一旦在这里自动修，线上可能从"少处理几个"变成"接口 500"。
+    "B905",
+
+    # B904：except 块里裸 raise。**不豁免，且已全部修完**（7 处补 from None）。
+    #   选 from None 而不是 from e：本项目的异常会渲染成面向用户的中文文案
+    #   （test_error_taxonomy.py 就是守这条的），挂上原始异常链会把
+    #   Python 内部类名泄进响应。from None 明确表示"内部异常已被这条例外语义取代"。
+]
+
+[lint.per-file-ignores]
+# 测试文件里大量 `import` 后重载模块、以及故意触发异常用的未用变量是常规操作
+"tests/*" = ["F401", "F811", "F841"]
+
+# ★★★★ 最重要的一条豁免：tools/registry.py的 F401 **全部豁免** ★★★
+#   不是因为它有风格问题，而是因为它整份文件都是「给测试打桩用的入口」。
+#   实测事故（2026-10-08）：清 F401 时删掉它的
+#     release_generation / settle_generation
+#   → tests/test_repair.py 立刻报
+#     AttributeError: module 'tools.registry' has no attribute 'settle_generation'
+#
+#   ★★ 为什么 ruff 拦不住（结构性的，不是工具缺陷）：
+#     ruff 判断「导入是否被使用」只看**本文件内**的引用。
+#     而测试是通过 `reg.settle_generation = lambda...` 打桩的 ——
+#     这种「先 import 模块、再按属性访问」的用法，
+#     在静态分析眼里就是**这个模块没用到这些名字**。
+#     判据本身没错，只是它看不见「属性打桩」这种用法。
+#
+#   ★★ 为什么要整份豁免而不是逐个 # noqa：
+#     这类"为了测试可打桩而存在的导入"以后还会加。
+#     逐个noqa 的话下一个加的人又会踩同一个坑。
+#     整份豁免 + 这段说明，是让**下一个人一开始就看见**。
+#
+#   ⇒ 防复发靠的不是这条豁免，而是 tests/test_patching.py：
+#     它用 AST 扫出所有「测试 import 的名字」与「模块属性打桩」，
+#     删任何一个都会在提交前被挡住（已做反向验证：删掉即 4通过/3失败）。
+"app/tools/registry.py" = ["F401"]
+
+# ★★ 只有 registry.py 需要整份豁免，理由见上。
+#
+# ★ prompt_builder / style_forge **不豁免**（第一版误给了整份，已收回）：
+#   收回理由：它们并不是「整体为测试打桩而存在」的模块，
+#   整份豁免会把**将来真正冗余的导入也一并藏起来** ——
+#   那就回到了「信号被关掉」的老问题。
+#   实测确认：这三个名字在文件内确实零使用，删除安全。
+#     style_forge.uuid / Any / FORGE_REPAIR_TIMEOUT_SEC
+#   （FORGE_REPAIR_TIMEOUT_SEC 在 config.py 定义、forge_stages.py 真正在用，
+#     style_forge 只是不再需要它。）
+#   ⇒ 防复发靠 tests/test_patching.py，不是靠豁免。
+
+# `except Exception as e:` 但块内用 logger.exception（自动带栈）而非 e。
+# 保留 e 的意义：让后来人一眼看到「这里曾想打印 e」，属于给人看的痕迹。
+# 改成裸 except 更好，但会抹掉这条信息。
+"app/services/drift.py" = ["F841"]
+
+# `MpoImagePlugin.MpoImageFile` 裸表达式 = 「确认这个符号能导入」的存在性断言。
+# 改成 assert hasattr(...) 多此一举；它紧接着就在用 MPO 写入器。
+"tests/test_mobile_upload.py" = ["B018"]
+
+# ★★ 真缺陷清单（2026-10-08 首次接入 ruff 时抓到，均已修）。
+#   这份清单是本文件最有价值的部分 —— 它记的不是「报了什么」，
+#   而是「为什么这些看起来像风格问题的报项，其实是能炸真实链路的缺陷」。
+#
+#   F821 forge_spec_guard._resolve_unknown_slots 用了 DERIVED_KEYS 但顶层没导入
+#        → 可达性已确认：forge_stages.py:336 调用，条件是校验报出「未解析占位符」。
+#          而函数 docstring 原文写着「实测出现过 {画面核心主体}」——
+#          **这是实测常态路径，不是罕见分支**，一旦走到就 NameError，
+#          工坊 3 分钟、几十次调用的链路直接归零。
+#        → 为什么之前没抓到：`grep _resolve_unknown_slots tests/` 零命中，
+#          这函数**根本没有测试**；端到端只跑正常编译路径，
+#          而它只在校验报错时才被调用。
+#        → 这就是静态检查的真正价值：**它查的是"存在但从没被执行到"的代码**，
+#          测试覆盖率再高也补不上这个洞。
+#   F821 prompt_cleanup._join 用了 Any 但没 import
+#        → 因有 from __future__ import annotations 运行时不炸，但标注是错的。
+#          （它被 family_renderer 用了 6 处，不是死代码。）
+#   F811 upload.py 函数内重复 import 顶层已有的 DEFAULT_SESSION。
+#
+#   另清理 2 处真死代码：image.py的 now、card_extractor.py 的 subject。
+# ───────────────────────────────────────────────────────────

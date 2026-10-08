@@ -73,3 +73,24 @@ deploy/public_storage/
 deploy/*.png
 !deploy/build_release.py
 !deploy/prepare_public.py
+
+# ── 覆盖率产物（2026-10-08）───────────────────────────────
+# 为什么不写死目录名：.coveragerc 里 html 目录写的是 ../docs/coverage，
+#   但 coverage 还会产出 .coverage 数据文件在**运行目录**（backend/）。
+#   两个位置、名字都可能随配置变，所以按**文件形态**忽略更稳。
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+docs/coverage/
+
+# ── 浏览器冒烟截图（失败时才生成，SMOKE_SHOT_DIR 指定）────────
+# 路径由 CI 传进来，属于可再生产物。
+_smoke_artifacts/
+backend/_smoke_artifacts/
+
+# ── 推送尝试的临时载荷（2026-10-08）────────────────────────
+# 上次用 MCP push_files 尝试推送时留下的空文件。
+# 它只有2 字节但会被当成"要提交的新文件"，容易误入。
+.push_payload.json
+backend/_cov_html/

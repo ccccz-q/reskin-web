@@ -32,7 +32,7 @@ if __package__ in (None, ""):
 from engine.loop import AgentRunResult, run as _run            # noqa: E402
 from governance.guard import GovernanceError, check_generation_allowed  # noqa: E402
 from infra.logging import logger                              # noqa: E402
-from infra.storage import from_url, to_url                    # noqa: E402
+from infra.storage import from_url
 from services.card_extractor import build_card                # noqa: E402
 from services.upload import load_upload_as_card_hint          # noqa: E402
 

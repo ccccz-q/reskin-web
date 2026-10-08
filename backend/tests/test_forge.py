@@ -765,6 +765,69 @@ finally:
     for _root in (_roota, _rootb):
         _sh.rmtree(_root, ignore_errors=True)
 
+# ── 9 · _resolve_unknown_slots 直测（2026-10-08）────────────
+# ★ 这段测试是被 ruff 逼出来的：
+#   该函数用了 DERIVED_KEYS 但顶层没导入 → 一旦走到就是 NameError。
+#   而"模型自造占位符"是**实测发生过的**常态路径（见函数 docstring），
+#   不是罕见分支 —— 也就是说这条故障能真实发生，且会让工坊 3 分钟的调用链归零。
+#   之前的测试没抓到它，是因为只跑正常编译路径，
+#   而这个函数只在**校验报错时**才被调用。
+#   所以这里必须直接构造那两种槽位走一遍—— 靠自然路径走不到。
+print("── 9. 模型自造槽位消解（回归：曾因缺 import 而 NameError）")
+
+_card = {
+    "subject": {"name": "登机口老爷爷"},
+    # ★ anchors 是**列表**且字段是 desc（实现里 "、".join(a["desc"] for a in card["anchors"])），
+    #   我一开始写成 card["anchor"] = {"desc": ...} → 拿到的是默认文案「视觉锚点」。
+    #   断言必须按真实字段写，否则测的是一个不存在的输入形状。
+    "anchors": [{"desc": "斜挎的布包"}, {"desc": "褪色军绿帽"}],
+    "environment": {"desc": "清晨航站楼玻璃幕墙"},
+}
+
+try:
+    from services.forge_spec_guard import _resolve_unknown_slots as _rus
+    # ★ 注意结构：segments 是三段式契约 {preserve, creative, forbid}，
+    #   不是列表 —— 一开始我按列表写断言，得到 'str' has no attribute 'get'。
+    #   契约的形态本身就是这个项目的核心，测试也得按真实形态写。
+    _doc = {"params": {},
+            "segments": {"preserve": "画面里有{画面核心主体} 与{视觉锚点}",
+                         "creative": "", "forbid": ""}}
+    _d1, _f1 = _rus(_doc, _card)
+    _p1 = str((_d1.get("segments") or {}).get("preserve") or "")
+    check("含「主体」的槽位被 Scene Card 消解",
+          "登机口老爷爷" in _p1, f"得到：{_p1[:70]}")
+    check("★ 含「锚点」的槽位被 Scene Card.anchors 消解",
+          "布包" in _p1 and "军绿帽" in _p1, f"得到：{_p1[:70]}")
+    check("★ 消解后不留任何 {xxx}",
+          "{" not in _p1, f"仍有占位符：{_p1[:70]}")
+
+    # 已声明参数对应的占位符**不该**被替换（只有自造槽位才处理）
+    _d2, _f2 = _rus({"params": {"figure_count": 2},
+                     "segments": {"preserve": "保留{figure_count_desc}",
+                                  "creative": "", "forbid": ""}}, _card)
+    _p2 = str((_d2.get("segments") or {}).get("preserve") or "")
+    check("已声明参数对应的占位符原样保留",
+          "figure_count_desc" in _p2, f"得到：{_p2[:70]}")
+
+    # ★ 无占位符的输入必须**完全不改动**（0 消解、0 改写）——
+    #   这是"调和层永不擅自改动正文"的保证，比"能跑"更重要。
+    _d3, _f3 = _rus({"params": {},
+                     "segments": {"preserve": "一座石桥，横跨平静水面",
+                                  "creative": "", "forbid": ""}}, _card)
+    _p3 = str((_d3.get("segments") or {}).get("preserve") or "")
+    check("无占位符时正文一字不改",
+          _p3 == "一座石桥，横跨平静水面" and _f3 == 0, f"得到：{_p3[:60]} fixed={_f3}")
+
+    # DERIVED_KEYS 必须在顶层可见（这条断言直接锁死本次修复）
+    import services.forge_spec_guard as _fsg
+    check("★ DERIVED_KEYS 已提升到模块顶层",
+          hasattr(_fsg, "DERIVED_KEYS"),
+          "否则 _resolve_unknown_slots 走到就是 NameError")
+except NameError as _e:
+    check("★ 消解函数不抛 NameError", False, f"仍缺导入：{_e}")
+except Exception as _e:
+    check("消解函数行为符合预期", False, f"{type(_e).__name__}: {_e}")
+
 print()
 print(f"结果：{PASS} 通过 / {FAIL} 失败")
 sys.exit(1 if FAIL else 0)

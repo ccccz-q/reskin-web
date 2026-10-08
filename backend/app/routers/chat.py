@@ -18,10 +18,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import queue
 import sys
 import threading
-from typing import Any, AsyncIterator, Iterator
+from typing import (Any, AsyncIterator)
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -33,7 +32,6 @@ if __package__ in (None, ""):
 
 from agents.image_agent import (                                         # noqa: E402
     AgentInputError,
-    resolve_thread_id,
     run_agent,
 )
 from config import ConfigMissing                                         # noqa: E402
@@ -374,7 +372,7 @@ async def chat_async(req: ChatRequest, sid: str = Depends(session_dep)) -> dict:
         task_id = tasks.submit(name="对话出图", kind="chat", owner=sid, fn=_fn,
                                meta={"thread_id": tid})
     except tasks.TaskBusy as e:
-        raise HTTPException(429, {"code": "task_busy", "message": str(e)})
+        raise HTTPException(429, {"code": "task_busy", "message": str(e)}) from None
     return {"ok": True, "task_id": task_id, "status": "running"}
 
 
@@ -396,7 +394,7 @@ async def chat_task(task_id: str, cursor: int = 0,
     except KeyError:
         # 不存在 / 不是本人的 → 统一 404，不泄露「这个 ID 存不存在」
         raise HTTPException(404, {"code": "task_not_found",
-                                  "message": "没有找到这个任务，可能已经完成并被清理了。"})
+                                  "message": "没有找到这个任务，可能已经完成并被清理了。"}) from None
     snap["ok"] = True
     return snap
 
@@ -407,7 +405,7 @@ async def chat_task_cancel(task_id: str, sid: str = Depends(session_dep)) -> dic
         ok = tasks.cancel(task_id, sid)
     except KeyError:
         raise HTTPException(404, {"code": "task_not_found",
-                                  "message": "没有找到这个任务，可能已经完成并被清理了。"})
+                                  "message": "没有找到这个任务，可能已经完成并被清理了。"}) from None
     return {"ok": True, "cancelled": ok}
 
 

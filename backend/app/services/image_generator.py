@@ -337,7 +337,7 @@ def resolve_size(
         try:
             w, h = (int(x) for x in low.split("x", 1))
         except ValueError:
-            raise ValueError(f"无法解析尺寸：{size!r}，应为 '1k'/'2k'/'4k' 或 'WxH'")
+            raise ValueError(f"无法解析尺寸：{size!r}，应为 '1k'/'2k'/'4k' 或 'WxH'") from None
         if w <= 0 or h <= 0:
             raise ValueError(f"尺寸 {size!r} 含非正值")
         if w * h < MIN_PIXELS:

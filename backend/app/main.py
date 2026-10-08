@@ -45,6 +45,7 @@ from config import (                                             # noqa: E402
     IMAGE_STORAGE_DIR,
     PUBLIC_MODE,
     public_dict,
+    SERVE_API_DOCS,
 
     IMAGE_BACKEND,
     IMAGE_API_KEY,
@@ -154,6 +155,11 @@ app = FastAPI(
     description="img2img 保真 + 创意叠加。自建 Tool-use Loop，无 LangGraph。",
     version="1.0.0",
     lifespan=lifespan,
+    # ★ 见 config.SERVE_API_DOCS 的注释：默认开放（本地/演示要能翻），
+    #   PUBLIC_MODE=1 时自动关闭——公网地址不该白送一份完整接口字典。
+    docs_url="/docs" if SERVE_API_DOCS else None,
+    redoc_url="/redoc" if SERVE_API_DOCS else None,
+    openapi_url="/openapi.json" if SERVE_API_DOCS else None,
 )
 
 app.add_middleware(
@@ -172,6 +178,53 @@ app.add_middleware(
 #   这样 Origin 校验跑在 CORS 处理之前，被拒的请求不会带上 CORS 头，
 #   浏览器也就读不到响应体）。
 app.add_middleware(LocalAccessMiddleware)
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """给**每个响应**补上浏览器安全响应头
+
+    ★ 为什么加（2026-10-08 参赛收尾）：
+      本项目处理的是**用户上传的照片**——一个典型的
+      「把不可信文件吃进内存、再把派生结果吐回浏览器」的场景。
+      之前只做了 CORS 白名单（管的是"谁能读我"），
+      但"我返回的东西浏览器该怎么看"这条线是空的：
+        · 没有 nosniff → 浏览器会猜响应类型（MIME sniffing），
+          构造一个 `x.png` 实为 HTML 的响应就可能被当脚本执行；
+        · 没有 frame-ancestors/X-Frame-Options → 页面能被任何站iframe 套壳，
+          用户在假页面里点"确定"；
+        · 没有 Referrer-Policy → 用户点站外链接时会把
+          `/api/image/...` 这样的路径带出去（含会话 id 的 URL）。
+      三行响应头的成本，换掉一整类攻击面。
+
+    ★ 为什么 CSP 写得比"全禁"松：
+      这个应用的核心交互就是 **<img> 取图 + fetch 调API**，
+      `img-src 'self' data: blob:` 与 `connect-src 'self'` 是刚需。
+      所以禁掉 inline script 是可以的（Vite 产物是外链 .js），
+      但要说清：**这不是 CSP 完备性证明**，是"挡住最容易得手的那一类"。
+
+    ★ 为什么安全头放在响应生成后统一补，而不是逐个路由写：
+      漏一个路由就是漏一个洞，而漏写是**默认行为**（不是显式选择）。
+      放在中间件里，"忘了加"这件事就不再可能发生。
+    """
+    response = await call_next(request)
+    # 与现有 CORS 头可能重复？CORS 中间件先注册（执行更晚），
+    # 但两者写的是不同头名，不冲突。
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+    # 图片是本站自己产出的，宽高不限、也不允许被第三方页面套壳引用
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; img-src 'self' data: blob:; "
+        "connect-src 'self'; object-src 'none'; base-uri 'self'; "
+        "frame-ancestors 'none'",
+    )
+    # 这个 API 不产生 HTML 响应，锁死 MIME 声明
+    if "Content-Type" in response.headers and "html" not in response.headers.get("Content-Type", ""):
+        response.headers.setdefault("Cross-Origin-Resource-Policy", "same-origin")
+    return response
 
 
 @app.middleware("http")

@@ -33,6 +33,11 @@ FILES = [
     "test_helper_doc.py",  # 小助手知识索引：新功能问得到 + 单节不被截断
     "test_governance.py",
     "test_config_boot.py",   # 启动期：安全闸门必须永远能跑完（曾 NameError 崩进程）
+    # ★ 排在静态清理类测试之后、并发之前：它只读 AST，不发请求，跑得极快，
+    #   但能在改动刚落地时就挡住「删掉被测试打桩的导入」这类事故
+    #   （2026-10-08 清 F401 时真发生过：删掉 registry.settle_generation
+    #   → test_repair AttributeError）。
+    "test_patching.py",
     "test_concurrency.py",   # 线程并发：不许超卖 / DB 损坏 / 网络层异常（曾漏判为确定性失败）
     "test_context_store.py",
     "test_agent_loop.py",

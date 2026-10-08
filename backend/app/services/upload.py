@@ -114,9 +114,9 @@ def validate_and_save(file: UploadFile, prefix: str = "upload",
         fmt = (im.format or "").upper()
         width, height = im.size
     except Image.DecompressionBombError:
-        raise HTTPException(413, "图片尺寸过大（疑似解压炸弹），请缩小后再上传")
+        raise HTTPException(413, "图片尺寸过大（疑似解压炸弹），请缩小后再上传") from None
     except Exception:
-        raise HTTPException(400, "无法解析为有效图片，请确认文件未损坏")
+        raise HTTPException(400, "无法解析为有效图片，请确认文件未损坏") from None
 
     # ── ②-b MPO：手机相册里的「动态照片」──────────────────────
     #
@@ -158,7 +158,6 @@ def validate_and_save(file: UploadFile, prefix: str = "upload",
     # ── ③ 按会话/日期分目录 + 随机名落盘 ────────────────────
     # default 会话保持旧布局（images/<日期>/），与本地已有数据兼容；
     # 匿名/登录会话落到自己的命名空间（images/<session>/<日期>/）。
-    from services.identity import DEFAULT_SESSION
     base = (IMAGE_STORAGE_DIR / session) if session != DEFAULT_SESSION \
         else IMAGE_STORAGE_DIR
     subdir = base / datetime.now().strftime("%Y-%m-%d")

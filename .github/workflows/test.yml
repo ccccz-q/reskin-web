@@ -110,6 +110,34 @@ jobs:
           set -o pipefail
           python backend/tests/run_all.py 2>&1 | tee backend/tests/run_all.log
 
+      - name: 量覆盖率
+        # ★ 为什么单独一步、而不是 coverage run tests/run_all.py：
+        #   run_all.py 是用 subprocess 逐个跑测试文件的，
+        #   而 coverage 默认只测自己那个进程 —— 那样跑出来是 **0.0%**，
+        #   一个明显失真的数字比没有数字更坏（会让人以为项目没测试）。
+        #   所以走 tests/cov_run.py：让每个测试文件各自在 coverage 下运行，
+        #   落并行数据文件后合并。
+        run: python backend/tests/cov_run.py 2>&1 | tee backend/tests/cov.log
+
+      - name: 覆盖率摘要存为 artifact
+        # README 里写着覆盖率数字，它必须**可复现**而不是一次性的。
+        # 把报告与 HTML 一起传上去：HTML 能点开看「哪几行没覆盖」，
+        # 纯数字做不到这件事。
+        if: always()
+        run: python -m coverage html --rcfile=backend/.coveragerc -d backend/_cov_html
+        working-directory: backend
+
+      - name: 上传覆盖率报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: |
+            backend/tests/cov.log
+            backend/_cov_html
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: 上传失败日志
         # 只在失败时跑：run_all.py 的实时输出已经进了 Actions 日志，
         # 这里补一份可下载的完整日志，方便本地复现。
@@ -120,3 +148,149 @@ jobs:
           path: backend/tests/run_all.log
           if-no-files-found: ignore
           retention-days: 7
+
+  # ═══════════════════════════════════════════════════════════
+  # ★ 前端 job（2026-10-08 新增）
+  #
+  # 为什么必须单独一个 job，而不是塞进 self-test 里：
+  #   此前 CI 里`npm` / `vitest` 出现 **0 次** —— 也就是说
+  #   **262 个前端用例从来不在 CI 跑过**，而 README 里的
+  #   「自测全绿」这句话在评委眼里是涵盖整个项目的。
+  #   这不是"少跑点东西"，是**对外陈述与实际执行不一致**。
+  #
+  # 而且这个缺口的代价已经实证过：
+  #   登录后整页崩进ErrorBoundary（const 的 TDZ）时，
+  #   vite build 通过、oxlint 0 error、179 个前端单测全绿——
+  #   **三道防线全部没拦住**，因为单测只测 src/lib 的纯函数，根本不渲染 App。
+  #   最后是靠真实浏览器冒烟（_smoke_frontend.mjs）抓到的。
+  #   那次教训直接写进了下方"浏览器冒烟"这一步。
+  # ───────────────────────────────────────────────────────────
+  frontend:
+    name: 前端（vitest + build + 浏览器冒烟）
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 装 Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 装依赖
+        # 用 npm ci而不是 npm install：前者严格按 lock 装，
+        # 「本地能过 CI 不能过」这类差异就少了一个来源。
+        run: npm ci
+
+      - name: 前端单测
+        # ★ package.json 里 test 脚本已经是 `vitest run`（自带 run），
+        #   所以这里**不要**再传 --run：`npm run test -- --run` 会变成
+        #   `vitest run --run`。虽然 vitest 容忍，但那是运气不是设计。
+        #   也不加 pipefail / tee：vitest 自带退出码，直接用。
+        run: npm run test
+
+      - name: 构建
+        # ★ build 也要跑，因为 vitest 只测纯函数——
+        #   语法/导入错误它看不见，而 build 能看见。
+        run: npm run build
+
+      - name: 浏览器冒烟（真实渲染一遍）
+        # ★★ 这一步是上面那次 TDZ 崩溃逼出来的，不可删。
+        #   单元测试、lint、build 三道防线全部漏掉了它——
+        #   因为它们都不会真的把 <App /> 挂到 DOM 上。
+        #   （脚本已改成可移植：先试标准 chromium，装不到再退回 msedge；
+        #     playwright 导入路径也是动态探测的，本机与 CI 共用一份。）
+        run: |
+          # playwright 装在 frontend/ 下，冒烟脚本从 backend/ 调用它，
+          # 所以 NODE_PATH 要指过去（否则脚本里 import 'playwright' 解析失败）
+          export NODE_PATH="$PWD/frontend/node_modules"
+          # ★ 在 frontend/ 下装浏览器二进制，而不是 npx --prefix ——
+          #   playwright 的 CLI 认的是「当前工作目录的 node_modules」，
+          #   --prefix 是 npm 的参数、npx 并不按那个语义解析，
+          #   写上去看着对、实际会找不到浏览器或装到别处。
+          (cd frontend && npx playwright install --with-deps chromium)
+          # 起后端：与 self-test 同一套"key 指向 example.invalid"的口径，
+          # 保证冒烟不可能真的花钱调生图。
+          cd backend
+          pip install -r requirements.txt
+          DEEPSEEK_API_KEY=sk-ci-placeholder-not-a-real-key \
+          DEEPSEEK_BASE_URL=https://example.invalid/v1 \
+          IMAGE_API_KEY=sk-ci-placeholder-not-a-real-key \
+          IMAGE_BASE_URL=https://example.invalid/v1 \
+          IMAGE_BACKEND=openai \
+          DISABLE_IMAGE_GENERATION=1 \
+          PUBLIC_MODE=0 ADMIN_PANEL=0 \
+          python -m uvicorn main:app --app-dir app --port 8000 &
+          # 等后端就绪（最多 30 秒）：冒烟脚本不等人，
+          # 硬跑会把"后端还没起来"误报成"页面崩了"
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/api/health >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          cd ..
+          # vite dev server：PUBLIC_MODE=0 时后端不托管前端产物
+          (cd frontend && npm run dev -- --port 5199 --host 127.0.0.1) &
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:5199 >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          # 失败时脚本会把截图写进这个目录（见脚本里的 SMOKE_SHOT_DIR）
+          SMOKE_SHOT_DIR="$PWD/backend/_smoke_artifacts" \
+          node backend/_smoke_frontend.mjs http://127.0.0.1:5199
+        # 冒烟失败要能看到页面截图
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-smoke-artifacts
+          path: backend/_smoke_artifacts
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ═══════════════════════════════════════════════════════════
+  # ★ 静态检查 job（2026-10-08 新增）
+  #
+  # 第一次接 ruff 就抓到一个会炸真实链路的缺陷：
+  #   F821 forge_spec_guard._resolve_unknown_slots 用了 DERIVED_KEYS 但顶层没导入。
+  #   而"模型自造占位符"是**实测常态路径**（函数 docstring 原文记录），
+  #   一旦走到就 NameError，工坊 3 分钟的链路直接归零。
+  #   为什么之前没抓到？因为那个函数**零测试覆盖**，
+  #   而端到端只跑正常编译路径 —— 它只在校验报错时才被调用。
+  #
+  # 这就是静态检查的真正价值：**它查的是"存在但从没被执行到"的代码**。
+  # 测试覆盖率再高也补不上这个洞。
+  # ───────────────────────────────────────────────────────────
+  lint:
+    name: 静态检查（ruff）
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 装 ruff
+        run: pip install ruff
+
+      - name: 跑 ruff
+        # ★ 配置在 backend/ruff.toml，只开 E9/F/B ——
+        #   刻意不开全量规则集。理由见 ruff.toml 内的注释：
+        #   噪声的代价不是刷屏，而是让人养成忽略警告的习惯。
+        #   现在 F 类里剩下的都是 F401/B904/F541 这类无害项，
+        #   真正的 F821/F811 已清零。
+        working-directory: backend
+        # 用 --output-format=github 让问题直接出现在 PR diff 旁，
+        # 而不是要人去翻 Actions 日志找。
+        run: ruff check . --output-format=github
+

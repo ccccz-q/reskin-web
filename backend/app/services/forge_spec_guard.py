@@ -34,6 +34,7 @@ if __package__ in (None, ""):
 
 from infra.logging import logger                                       # noqa: E402
 from services.family_renderer import (                                 # noqa: E402
+    DERIVED_KEYS,
     FamilyRenderError,
     render_family,
     validate_family,
@@ -75,8 +76,6 @@ def _reconcile_dangling_placeholders(doc: dict) -> list[str]:
     ★ 与 QC 的关系：这是**前置**调和，QC 仍然是唯一的质量门——
       摘完如果还有别的错，QC 照常拒。我们只解决"机械可修"的那一类。
     """
-    from services.family_renderer import DERIVED_KEYS
-
     dicts = set(doc.get("dicts") or {})
     params = doc.get("params") or {}
     removed: list[str] = []

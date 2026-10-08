@@ -166,6 +166,20 @@ BACKEND_PORT = int(os.getenv("BACKEND_PORT", "8000"))
 PUBLIC_MODE = os.getenv("PUBLIC_MODE", "0").strip().lower() in ("1", "true", "yes", "on")
 FRONTEND_DIST = _abs_path("FRONTEND_DIST", PROJECT_ROOT / "frontend" / "dist")
 
+# ★ API 文档开关（2026-10-08 参赛收尾新增）
+#   FastAPI 的 /docs 与 /openapi.json 默认**开放**，于是任何人拿到公网地址
+#   就能翻出全部端点、参数、字段名——省掉了他自己探测的时间，
+#   也把内部结构（路径命名/会话头名/配额参数）一次性交出去。
+#   但对参赛场景要分清两种场合：
+#     · 本机开发/ 演示讲解 → **要开**。现场能翻 API 是加分项，
+#       能直观说明"这个项目不是几个接口拼起来的"。
+#     · 长期公网部署 → **默认关**（PUBLIC_MODE=1 时自动关，除非显式打开）。
+#   所以口径是"**默认开、公开模式自动关**"，而不是"默认关"——
+#   后者会让本地开发和线上行为不一致，是另一种坑。
+SERVE_API_DOCS = os.getenv(
+    "SERVE_API_DOCS", "0" if PUBLIC_MODE else "1"
+).strip().lower() in ("1", "true", "yes", "on")
+
 _CORS_RAW = os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173")
 CORS_ORIGINS: list[str] = [x.strip() for x in _CORS_RAW.split(",") if x.strip()]
 # 本项目无账号 / Cookie / 凭据体系 → credentials 恒 False。
