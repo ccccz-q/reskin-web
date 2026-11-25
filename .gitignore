@@ -116,13 +116,8 @@ docs/gallery_webp/
 docs/evidence/ablation/
 
 # ── 参赛成品集（2026-10-09）─────────────────────────────
-# ★ 依据上面同一条标准判断：**能再生就不入库**。
-#   原图：python tools/fetch_album_assets.py
-#   成品：python tools/build_album_assets.py
-# 原图 5 张约 3.9MB + 成品 5 张约 2.7MB，进库会让 clone 变慢，
-# 而这两个脚本能确定性重建 → 不入库，只留脚本与 manifest。
-assets/album/generated/
-frontend/public/album/generated/
-# ★ 但 manifest 要入库 —— 前端靠它渲染成品集，且它是「来源与许可」的留痕。
-!assets/album/manifest.json
-!frontend/public/album/manifest.json
+# 原图 5 张（Pexels，约 3.9MB）与成品 5 张（约 2.7MB）**都入库**。
+# 原判断是「能再生就不入库」，但再生的 build_album_assets.py 需要生图 API 密钥，
+# 开源使用者拿不到；不入库的话画册页会整页裂图。
+# 体积若成为问题，改用 LFS 或按需重生成，不要悄悄加回 ignore。
+# （不加 ignore：成品图直接入库，见上）
