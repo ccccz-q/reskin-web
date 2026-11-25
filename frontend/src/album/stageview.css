@@ -1,0 +1,196 @@
+/**
+ * 作品展（StageView）样式
+ *
+ * ★ 设计取向：像美术馆的展墙，不的工具栏。
+ *   深色底 + 聚光打在作品上，四周收暗，让图成为唯一的主角。
+ *   ⇒ 顶部操作条透明浮起（不用实心按钮条，避免抢视觉）
+ */
+
+/* ── 舞台 ────────────────────────────────────────────── */
+.stageview {
+  position: fixed; inset: 0; z-index: 80;
+  display: grid; grid-template-rows: auto 1fr auto;
+  background:
+    radial-gradient(90% 60% at 50% 38%, #2b2723 0%, #1a1714 55%, #100e0c 100%);
+  color: #eae3d4;
+  animation: sv-in .26s ease both;
+}
+@keyframes sv-in { from { opacity: 0 } to { opacity: 1 } }
+
+/* ── 顶部条 ──────────────────────────────────────────── */
+.sv-top {
+  display: flex; align-items: center; gap: 16px;
+  padding: 16px 22px;
+  z-index: 3;
+}
+.sv-title { display: flex; align-items: baseline; gap: 12px; min-width: 0 }
+.sv-title b {
+  font-size: 17px; font-weight: 600; letter-spacing: .04em;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sv-title span {
+  font-size: 12px; letter-spacing: .2em; color: #a1968a; white-space: nowrap;
+}
+.sv-acts { margin-left: auto; display: flex; align-items: center; gap: 8px }
+
+.sv-btn {
+  border: 1px solid rgb(255 255 255 / .16);
+  background: rgb(255 255 255 / .05);
+  color: #eae3d4;
+  border-radius: 999px;
+  padding: 7px 15px; font-size: 12.5px; cursor: pointer;
+  backdrop-filter: blur(8px);
+  transition: background .16s ease, border-color .16s ease, transform .16s ease;
+}
+.sv-btn:hover {
+  background: rgb(255 255 255 / .13);
+  border-color: rgb(255 255 255 / .3);
+  transform: translateY(-1px);
+}
+.sv-btn:active { transform: none }
+
+/* ★ 关闭按钮：不再是右上角一个孤零零的 ✕
+   —— 做成「带文字的圆形退出键」，悬停时展开，
+   既不难认，也不会误触（比纯✕ 大得多）。 */
+.sv-close {
+  position: relative;
+  width: 34px; height: 34px;
+  border: 1px solid rgb(255 255 255 / .18);
+  border-radius: 50%;
+  background: rgb(255 255 255 / .06);
+  color: #eae3d4; cursor: pointer;
+  font-size: 13px; line-height: 1;
+  display: grid; place-items: center;
+  backdrop-filter: blur(8px);
+  overflow: hidden;
+  transition: background .2s ease, width .26s cubic-bezier(.4,0,.2,1),
+              border-color .2s ease;
+}
+.sv-close::before {
+  /* 悬停时从圆心展开的底色 */
+  content: ''; position: absolute; inset: 0;
+  background: rgb(190 90 70 / .85);
+  transform: scale(0); border-radius: 50%;
+  transition: transform .26s cubic-bezier(.4,0,.2,1);
+}
+.sv-close:hover {
+  width: 78px; border-color: rgb(190 90 70 / .9);
+  background: rgb(190 90 70 / .3);
+}
+.sv-close:hover::before { transform: scale(1) }
+.sv-close > * { position: relative; z-index: 1 }
+.sv-close-text {
+  font-size: 12px; letter-spacing: .1em; white-space: nowrap;
+  max-width: 0; overflow: hidden;
+  transition: max-width .26s cubic-bezier(.4,0,.2,1), margin .26s;
+}
+.sv-close:hover .sv-close-text { max-width: 46px; margin-left: 5px }
+
+/* ── 主体：可拖动 ────────────────────────────────────── */
+.sv-body {
+  display: grid; place-items: center;
+  min-height: 0; padding: 4px 78px 10px;
+  cursor: grab;
+  transition: transform .3s cubic-bezier(.22, .61, .36, 1);
+}
+.sv-body.is-dragging {
+  cursor: grabbing;
+  transition: none;              /* ★ 跟手：拖动中必须关掉过渡 */
+}
+.sv-body.is-turning { transition: transform .3s cubic-bezier(.22,.61,.36,1) }
+
+.sv-frame {
+  position: relative;
+  width: auto; height: 100%; max-width: 100%;
+  aspect-ratio: 3 / 5;
+  box-shadow: 0 26px 70px rgb(0 0 0 / .6), 0 2px 8px rgb(0 0 0 / .4);
+  border-radius: 2px;
+  overflow: hidden;
+}
+.sv-img {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%; object-fit: contain;
+  background: var(--album-paper, #efe8d8);
+  pointer-events: none;          /* ★ 让拖动翻页不被图片吃掉 */
+  user-select: none;
+}
+.sv-note {
+  position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%);
+  font-size: 11px; letter-spacing: .08em; color: #8b8071;
+  background: rgb(20 18 15 / .62); padding: 4px 11px; border-radius: 999px;
+  z-index: 3;
+}
+.sv-ph {
+  display: grid; place-items: center;
+  width: min(430px, 60vw); aspect-ratio: 3/5;
+  background: repeating-linear-gradient(45deg, #2a2621, #2a2621 9px, #241f1b 9px, #241f1b 18px);
+  color: #8b8071; font-size: 13px; letter-spacing: .1em;
+}
+
+/* ── 左右翻页 ────────────────────────────────────────── */
+.sv-nav {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  z-index: 4;
+  width: 46px; height: 46px;
+  border: 1px solid rgb(255 255 255 / .16);
+  border-radius: 50%;
+  background: rgb(20 18 15 / .5);
+  color: #eae3d4; font-size: 22px; line-height: 1; cursor: pointer;
+  backdrop-filter: blur(8px);
+  display: grid; place-items: center;
+  transition: background .16s, border-color .16s, transform .16s;
+}
+.sv-nav:hover {
+  background: rgb(255 255 255 / .14);
+  border-color: rgb(255 255 255 / .32);
+  transform: translateY(-50%) scale(1.06);
+}
+.sv-nav:active { transform: translateY(-50%) scale(.98) }
+.sv-nav--l { left: 18px }
+.sv-nav--r { right: 18px }
+
+/* ── 底部：缩略图条 ──────────────────────────────────── */
+.sv-bottom { padding: 12px 22px 20px; z-index: 3 }
+.sv-strip {
+  display: flex; gap: 10px; justify-content: center; flex-wrap: wrap;
+}
+.sv-chip {
+  position: relative;
+  width: 52px; padding: 0; cursor: pointer;
+  border: 1px solid rgb(255 255 255 / .14);
+  border-radius: 3px; overflow: hidden;
+  background: transparent;
+  opacity: .5;
+  transition: opacity .18s ease, border-color .18s ease, transform .18s ease;
+}
+.sv-chip img { width: 100%; aspect-ratio: 3/5; object-fit: cover; display: block }
+.sv-chip span {
+  display: block; font-size: 9.5px; letter-spacing: .06em;
+  padding: 2px 2px 3px; color: #cfc6b6;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  background: rgb(20 18 15 / .82);
+}
+.sv-chip:hover { opacity: .85; transform: translateY(-2px) }
+.sv-chip.is-on {
+  opacity: 1;
+  border-color: #dcc9a6;
+  box-shadow: 0 0 0 1px rgb(220 201 166 / .5);
+}
+.sv-hint {
+  margin-top: 12px; text-align: center;
+  font-size: 11.5px; letter-spacing: .1em; color: #8b8071;
+}
+
+/* ── 窄屏 ────────────────────────────────────────────── */
+@media (max-width: 760px) {
+  .sv-nav { width: 38px; height: 38px; font-size: 18px }
+  .sv-nav--l { left: 8px }
+  .sv-nav--r { right: 8px }
+  .sv-body { padding: 4px 50px 8px }
+  .sv-title b { font-size: 15px }
+  .sv-btn { padding: 6px 11px; font-size: 12px }
+}
+@media (prefers-reduced-motion: reduce) {
+  .stageview { animation: none }
+  .sv-body { transition: none }
+}

@@ -1,0 +1,105 @@
+/* 成品编辑器 · 样式 */
+
+.asredt {
+  position: fixed; inset: 0; z-index: 90;
+  display: grid; place-items: center;
+  background: rgb(18 15 12 / .74);
+  backdrop-filter: blur(6px);
+  animation: asredt-in .2s ease both;
+}
+@keyframes asredt-in { from { opacity: 0 } to { opacity: 1 } }
+
+.asredt-box {
+  width: min(460px, 92vw);
+  background: #f7f2e7;
+  border-radius: 4px;
+  border: 1px solid #d8ccb4;
+  box-shadow: 0 28px 70px rgb(0 0 0 / .5);
+  overflow: hidden;
+  animation: asredt-pop .24s cubic-bezier(.2, .9, .3, 1.2) both;
+}
+@keyframes asredt-pop {
+  from { transform: translateY(10px) scale(.98); opacity: 0 }
+  to { transform: none; opacity: 1 }
+}
+
+.asredt-head {
+  display: flex; align-items: center;
+  padding: 15px 18px 13px;
+  border-bottom: 1px solid #e2d8c2;
+}
+.asredt-head b { font-size: 15px; font-weight: 600; color: #40382e }
+.asredt-x {
+  margin-left: auto; border: 0; background: transparent;
+  color: #8b8071; font-size: 14px; cursor: pointer;
+  width: 26px; height: 26px; border-radius: 50%;
+  transition: background .15s, color .15s;
+}
+.asredt-x:hover { background: #e8dfcb; color: #40382e }
+
+.asredt-tabs { display: flex; gap: 0; border-bottom: 1px solid #e2d8c2 }
+.asredt-tabs button {
+  flex: 1; border: 0; background: transparent; cursor: pointer;
+  padding: 10px 0; font-size: 13px; color: #8b8071;
+  border-bottom: 2px solid transparent;
+  transition: color .16s, border-color .16s, background .16s;
+}
+.asredt-tabs button:hover { background: #f1ead9 }
+.asredt-tabs button.is-on {
+  color: #463d31; border-bottom-color: #463d31; font-weight: 600;
+}
+
+.asredt-body { padding: 17px 18px; display: grid; gap: 13px }
+.asredt-body label { display: grid; gap: 6px }
+.asredt-body label > span {
+  font-size: 11.5px; letter-spacing: .14em; color: #7d7160;
+}
+.asredt-body input,
+.asredt-body textarea,
+.asredt-body select {
+  width: 100%; padding: 9px 11px;
+  border: 1px solid #d5c9b0; border-radius: 3px;
+  background: #fdfaf3; color: #3f382e;
+  font-size: 13.5px; font-family: inherit; line-height: 1.6;
+  resize: vertical;
+}
+.asredt-body input:focus,
+.asredt-body textarea:focus,
+.asredt-body select:focus {
+  outline: none; border-color: #a8977a;
+  box-shadow: 0 0 0 2px rgb(168 151 122 / .22);
+}
+
+.asredt-note {
+  margin: 0; padding: 9px 11px;
+  background: #efe7d5; border-radius: 3px;
+  font-size: 11.5px; line-height: 1.75; color: #6d6252;
+}
+.asredt-warn {
+  padding: 10px 12px; border-radius: 3px;
+  background: #f6e6df; border: 1px solid #e0c3b4;
+  font-size: 11.5px; line-height: 1.8; color: #8a5340;
+}
+.asredt-err {
+  padding: 9px 12px; border-radius: 3px;
+  background: #f2dcd8; color: #a33;
+  font-size: 12px;
+}
+
+.asredt-foot {
+  display: flex; justify-content: flex-end; gap: 9px;
+  padding: 13px 18px 16px;
+  border-top: 1px solid #e2d8c2;
+  background: #f3ecdc;
+}
+.asredt-btn {
+  border: 1px solid #c9bda3; background: #fdfaf3; color: #5b5142;
+  border-radius: 3px; padding: 8px 19px; font-size: 13px; cursor: pointer;
+  transition: background .15s, border-color .15s;
+}
+.asredt-btn:hover:not(:disabled) { background: #efe7d5 }
+.asredt-btn.is-primary {
+  background: #463d31; color: #f7f2e6; border-color: #463d31;
+}
+.asredt-btn.is-primary:hover:not(:disabled) { background: #574c3d }
+.asredt-btn:disabled { opacity: .42; cursor: default }

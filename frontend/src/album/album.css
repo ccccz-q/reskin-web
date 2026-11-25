@@ -1,0 +1,281 @@
+/**
+ * 电子画册样式
+ *
+ * ★ 与普通弹窗的差别全在三个地方（缺一个就不像书）：
+ *   ① 双页对开：左右两页同时铺开，中间是书脊
+ *   ② **书口渐变阴影**：两页各向书脊方向渐变 —— 这是"它们连成一本"的关键
+ *   ③ 翻页时页面绕**书脊**旋转（transform-origin 在书脊那一侧），不是平移
+ */
+
+/* ── 页面几何与纸色（由 CSS 变量驱动，便于换尺寸/换纸色）─────────
+   竖版 3:5 —— 与「拾景纸刊」家族原生画幅一致（1664x2776），
+   所以生成的图不用二次裁切。*/
+.album-stage {
+  --pw: 420px;--ph: 700px;
+  --paper: #f7f2e7;
+  --paper-dim: #efe7d7;
+  --dur: 820ms;
+  --ease: cubic-bezier(0.42, 0, 0.2, 1);
+}
+
+/* ── 舞台与书本 ───────────────────────────────────────────── */
+.album-stage {
+  position: fixed; inset: 0; z-index: 70;
+  display: grid; place-items: center;
+  background:
+    radial-gradient(120% 80% at 50% 12%, #3b352d 0%, #201d19 62%, #17151200 100%),
+    #1a1714;
+  backdrop-filter: blur(4px);
+  animation: album-fade .28s ease both;
+}
+@keyframes album-fade { from { opacity: 0 } to { opacity: 1 } }
+
+/* 桌面：摊开的双页；移动：单页 */
+.album-book {
+  position: relative;
+  /* ★ 这里踩过一个坑：`calc(var(--pw) * 2px)`。
+     `--pw` 是无单位数字 420，而 CSS 里「长度 × 单位」是**非法运算** ——
+     整条声明被丢弃，于是 .album-book 的宽高变成 0×0，书页完全不显示。
+     ⇒ 改为：把变量的单位也带上（--pw: 420px），直接用 calc(var(--pw) * 2)。 */
+  width: calc(var(--pw) * 2);
+  height: var(--ph);
+  perspective: 2200px;
+  perspective-origin: 50% 42%;
+  transition: transform .5s cubic-bezier(.3, 0, .2, 1);
+  transform-style: preserve-3d;
+}
+/* 视口不够宽时收成单页（避免两页被裁） */
+@media (max-width: 900px) {
+  .album-book { width: var(--pw); }
+}
+
+/* 整本在桌面上的轻微投影 —— 让书"落在"桌面上 */
+.album-book::after {
+  content: "";
+  position: absolute; inset: 6px -2px -14px;
+  background: radial-gradient(60% 46% at 50% 50%, rgba(0, 0, 0, .55), transparent 72%);
+  filter: blur(12px);
+  transform: translateZ(-40px);
+  pointer-events: none;
+}
+
+/* ── 单页 ────────────────────────────────────────────────── */
+.album-page {
+  position: absolute; top: 0;
+  width: var(--pw); height: var(--ph);
+  overflow: hidden;
+  background: var(--paper);
+  transform-style: preserve-3d;
+  backface-visibility: hidden;
+}
+.album-page--left  { left: 0;transform-origin: right center; }
+.album-page--right { right: 0; transform-origin: left center; }
+
+/* 翻到一半 / 已翻过的页：绕书脊旋转 180° */
+.album-page.is-turned {
+  transform: rotateY(-180deg);
+  transition: transform var(--dur) var(--ease);
+}
+.album-page:not(.is-turned) {
+  transition: transform var(--dur) var(--ease);
+}
+/* ★ 静止的右页必须在**底层**：翻页时它是"下一页"，
+   要等着被翻过来的左页盖住。
+   （原先右页跟着转走 —— 表现为「右页消失，翻完再出现」） */
+.album-page--right { z-index: 1; }
+.album-page--left  { z-index: 2; }
+/* 翻页中的左页抬到最上层，确保盖在右页之上 */
+.album-page--left.is-moving { z-index: 4; }
+/* 反面（背面朝上时看到的那一面） */
+.album-page__back {
+  position: absolute; inset: 0;
+  transform: rotateY(180deg);
+  backface-visibility: hidden;
+  background: var(--paper-dim);
+  display: grid; place-items: center;
+}
+
+/* ★★ 书口渐变阴影 —— 这一条让两页"看起来是连着的"
+   做法：在靠书脊的那一侧铺一条由深到浅的渐变 */
+.album-page--left::before,
+.album-page--right::before {
+  content: "";
+  position: absolute; top: 0; bottom: 0;
+  width: clamp(16px, 5%, 34px);
+  z-index: 6;
+  pointer-events: none;
+}
+.album-page--left::before {
+  right: 0;
+  background: linear-gradient(to left,
+    rgb(30 25 18 / 16%), rgb(30 25 18 / 5%) 38%, transparent);
+}
+.album-page--right::before {
+  left: 0;
+  background: linear-gradient(to right,
+    rgb(30 25 18 / 16%), rgb(30 25 18 / 5%) 38%, transparent);
+}
+
+/* 翻页时扫过页面的受光高光 */
+.album-sheen {
+  position: absolute; inset: 0; z-index: 7;
+  pointer-events: none;
+  background: linear-gradient(102deg,
+    transparent 34%, rgb(255 255 255 / .42) 48%, transparent 62%);
+  opacity: 0;
+  transition: opacity .28s ease;
+}
+.album-page.is-moving .album-sheen { opacity: 1; }
+
+/* ── 纸张质感 ────────────────────────────────────────────── */
+.album-paper {
+  position: absolute; inset: 0;
+  background: var(--paper);
+}
+/* 纸纤维：极轻的横向纹理（图一密就假了） */
+.album-grain {
+  position: absolute; inset: 0; opacity: .5;
+  background-image:
+    repeating-linear-gradient(0deg,
+      rgb(120 100 70 / .035) 0 1px, transparent 1px 3px),
+    repeating-linear-gradient(90deg,
+      rgb(120 100 70 / .02) 0 1px, transparent 1px 4px);
+}
+
+/* ── 内容区 ──────────────────────────────────────────────── */
+.album-photo {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  object-fit: cover;
+}
+/* ★ 实测踩过：画册页是 3:5 竖版，而素材可能是横图
+   （例如对比图本身就是横的）。cover 会把竖版裁得只剩中间一条。
+   ⇒ 画册内一律 contain，完整呈现，不裁内容。 */
+.album-photo--fit { object-fit: contain; background: var(--paper); }
+
+.album-caption {
+  position: absolute; left: 0; right: 0; bottom: 0; z-index: 5;
+  padding: 76px 34px 34px;
+  background: linear-gradient(180deg, transparent, rgb(38 30 20 / .88));
+  color: #f6f0e3;
+}
+.album-place {
+  font-size: 12px; letter-spacing: .26em; opacity: .92;
+  /* ★ 实测踩过：标题与故事会连成一片，因为两者都是块级且行高紧。
+     ⇒ 给地点/标题一个固定的下边距，而不是靠行高凑。 */
+  margin-bottom: 2px;
+}
+.album-title {
+  margin: 0 0 9px;
+  font-size: 25px; font-weight: 600; line-height: 1.28;
+  text-shadow: 0 1px 0 rgb(0 0 0 / .34);   /* 压印感 */
+}
+.album-story {
+  font-size: 13px; line-height: 1.72; opacity: .92;
+  /* ★ 限制行数：故事过长会把版面顶乱，超出部分省略而不是溢出 */
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* folio 页码：verso 在左、recto 在右（参考实现的细节） */
+.album-folio {
+  position: absolute; bottom: 16px; z-index: 8;
+  font-size: 12px; letter-spacing: .1em;
+  color: rgb(70 60 46 / .72);
+}
+.album-page--left  .album-folio { left: 22px; }
+.album-page--right .album-folio { right: 22px; }
+
+/* ── 封面 / 封底 ────────────────────────────────────────── */
+.album-cover {
+  position: absolute; inset: 0;
+  display: grid; place-items: center;
+  text-align: center;
+  padding: 40px;
+  background:
+    radial-gradient(90% 70% at 50% 26%, #fbf7ee, #f0e8d8);
+}
+.album-cover-mark {
+  font-size: 46px; line-height: 1; margin-bottom: 16px; opacity: .78;
+}
+.album-cover-title {
+  font-size: 34px; font-weight: 700; letter-spacing: .18em;
+  color: #4a4036;
+  text-shadow: 0 1px 0 rgb(255 255 255 / .8);    /* 压印 */
+}
+.album-cover-sub {
+  margin-top: 13px;
+  font-size: 12px; letter-spacing: .34em; color: #8b7f6f;
+}
+.album-cover-rule {
+  width: 46px; height: 1px; margin: 22px auto;
+  background: linear-gradient(90deg, transparent, #a99a83, transparent);
+}
+.album-cover-foot {
+  position: absolute; bottom: 30px; left: 0; right: 0;
+  text-align: center; font-size: 11px; letter-spacing: .2em; color: #9c9080;
+}
+.album-endpaper {
+  position: absolute; inset: 0;
+  background: #e9e3d4;
+  display: grid; place-items: center;
+}
+.album-endpaper-inner {
+  text-align: center; color: #7d7160; font-size: 12.5px; line-height: 2;
+  letter-spacing: .14em;
+}
+
+/* ── 控制条 ─────────────────────────────────────────────── */
+.album-bar {
+  position: absolute; left: 50%; bottom: 26px;
+  transform: translateX(-50%);
+  display: flex; align-items: center; gap: 14px;
+  padding: 9px 15px;
+  border-radius: 999px;
+  background: rgb(22 19 16 / .66);
+  backdrop-filter: blur(8px);
+  color: #ece5d7;
+  box-shadow: 0 8px 28px rgb(0 0 0 / .4);
+}
+.album-btn {
+  width: 34px; height: 34px; padding: 0;
+  border: 1px solid rgb(255 255 255 / .16);
+  border-radius: 50%;
+  background: transparent; color: inherit;
+  font-size: 17px; line-height: 1; cursor: pointer;
+  transition: background .16s ease, opacity .16s;
+}
+.album-btn:hover:not(:disabled) { background: rgb(255 255 255 / .14); }
+.album-btn:disabled { opacity: .26; cursor: default; }
+.album-status {
+  min-width: 92px; text-align: center;
+  font-size: 12px; letter-spacing: .1em;
+}
+.album-dots { display: flex; gap: 6px; }
+.album-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: rgb(255 255 255 / .3); cursor: pointer;
+  transition: transform .18s, background .18s;
+}
+.album-dot.is-on { background: #ddcdaa; transform: scale(1.3); }
+
+.album-close {
+  position: absolute; top: 22px; right: 26px;
+  width: 34px; height: 34px;
+  border: 0; border-radius: 50%;
+  background: rgb(22 19 16 / .62); color: #ece5d7;
+  font-size: 15px; cursor: pointer;
+  backdrop-filter: blur(6px);
+}
+
+/* ── 降低动态：直接切，不做过渡 ─────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  .album-book, .album-page, .album-sheen { transition: none !important; }
+  .album-stage { animation: none; }
+}
+
+/* ── 窄屏：控制条压缩、书缩小 ───────────────────────────── */
+@media (max-width: 900px) {
+  .album-bar { gap: 10px; padding: 8px 12px; }
+  .album-status { min-width: 74px; font-size: 11px; }
+}

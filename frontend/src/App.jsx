@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, useMemo } from 'react'
 import { api } from './api'
 import ParamForm from './ParamForm'
 import Workshop from './Workshop'
@@ -13,6 +13,8 @@ import { useGallery } from './hooks/useGallery'
 import { useFamilies } from './hooks/useFamilies'
 import GalleryStrip from './components/GalleryStrip'
 import Lightbox from './components/Lightbox'
+import Showcase from './album/Showcase'
+import AlbumViewer from './album/AlbumViewer'
 import RepairPanel from './components/RepairPanel'
 import ForgeNotice from './components/ForgeNotice'
 import SourcePanel from './components/SourcePanel'
@@ -43,6 +45,13 @@ export default function App() {
   const [workshopOpen, setWorkshopOpen] = useState(false)
   const [galleryOpen, setGalleryOpen] = useState(false)
   const [helperOpen, setHelperOpen] = useState(false)     // 🧭 小助手：讲解 + 看图推荐
+  // ★ 成品集（独立入口）：展示「实拍 → 文创成品」的结果。
+  //   刻意做成**独立入口**而不是"出图后问要不要做成一组"——
+  //   ① 后者对主流程是打扰（每张图都要面对这个问题）；
+  //   ② 前者逻辑清楚（主动找），而且对现有代码**零侵入**。
+  const [showcaseOpen, setShowcaseOpen] = useState(false)
+  // ★ 从顶栏直接开画册（不经过作品展）
+  const [albumOnlyOpen, setAlbumOnlyOpen] = useState(false)
   // 刚生成的图 → 交给环绕轮播定位亮相
   const [latest, setLatest] = useState(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -144,6 +153,46 @@ export default function App() {
     quota, ready, reloadFamilies, onRequestDeleteFamily,
     delArm, builtinIds, refreshQuota,
   } = useFamilies({ aliveRef, flash })
+
+  // ★ 成品集数据（实拍原图 + 已生成的成品 + 说明）。
+    //   来源静态清单，随构建拷进public —— 不走后端，
+    //   避免为了展示而新增接口。
+  const [showcaseItems, setShowcaseItems] = useState([])
+  useEffect(() => {
+    let alive = true
+    fetch('/album/manifest.json')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((man) => {
+        if (!alive || !man) return
+        const nameOf = { zine: '拾景纸刊', risograph_travel_print: 'Riso 旅行版画' }
+        setShowcaseItems((man.records || [])
+          .filter((r) => r.generated)
+          .map((r) => ({
+            file: `/album/${r.file}`,
+            generated: `/album/generated/${r.generated}`,
+            place: r.place, title: r.title, story: r.story,
+            family: r.family, familyName: nameOf[r.family] || r.family,
+            // ★ w/h 用于对比层的容器比例（横图不能塞进 3:5 竖版）
+            w: r.w, h: r.h,
+          })))
+      })
+      .catch(() => { /* 清单缺失不该让创作页报错，成品集就显示为空 */ })
+    return () => { alive = false }
+  }, [])
+
+  // ★ 顶栏画册用的页序：封面 → 内容 → 封底
+    //   与作品展内部保持一致（AlbumViewer 自己会补齐对开）
+  const showcaseAlbumPages = useMemo(() => {
+    const body = showcaseItems.filter((it) => it.generated)
+    const pad = body.length % 2 ? [...body, { blank: true }] : body
+    // ★ 必须映射出 `src` —— AlbumViewer 的 buildLeafFace 只认 page.src。
+    //   漏了这个映射 ⇒ 内页不生成 <img> ⇒ 画册图片空白（实测踩过）。
+    return [{ kind: 'cover' },
+      ...pad.map((it) => ({
+        src: it.generated, place: it.place, title: it.title, story: it.story,
+      })),
+      { kind: 'back' }]
+  }, [showcaseItems])
 
   // ── 参数变化 → 重新渲染提示词（0 成本，毫秒级）
   useEffect(() => {
@@ -285,6 +334,23 @@ export default function App() {
                   onClick={() => setHelperOpen(true)}
                   title="功能讲解 · 上传照片让它推荐适合的风格">
             🧭 小助手
+          </button>
+          {/* ★ 电子画册：顶栏一级入口。
+               用户反馈"画册太隐蔽"—— 藏在小按钮里等于没有。
+               ⇒ 它与「作品展」并列，看单张走作品展，想翻书直接点这里。 */}
+          <button type="button" className="btn ghost showcase-entry"
+                  onClick={() => setAlbumOnlyOpen(true)}
+                  title="电子画册 · 双页翻书">
+            📖 电子画册
+          </button>
+          {/* ★ 作品展：独立入口，不干扰单图创作流程。
+             命名教训（2026-10-09 用户实测）：原先叫「成品集」，
+             听起来像"存放东西的地方" ⇒ 被当成仓库的一部分，找不到入口。
+             改成「作品展」+ 实心强调样式，一眼看出是"看作品"的地方。 */}
+          <button type="button" className="btn ghost showcase-entry"
+                  onClick={() => setShowcaseOpen(true)}
+                  title="查看成品：系列海报与电子画册，可左右拖动翻页">
+            🎨 作品展
           </button>
           <button type="button" className="btn ghost ws-open" onClick={() => setGalleryOpen(true)}
                   title="历史生成图，按日期归档，可多选打包下载">
@@ -479,6 +545,40 @@ export default function App() {
           flash={flash}
         />
       )}
+      {/* ★ 顶栏「电子画册」直接进：不需要先开作品展 */}
+      {albumOnlyOpen && showcaseAlbumPages.length > 0 && (
+        <AlbumViewer pages={showcaseAlbumPages}
+                     onClose={() => setAlbumOnlyOpen(false)} />
+      )}
+      {albumOnlyOpen && showcaseAlbumPages.length === 0 && (
+        <div className="sc-cmp" onClick={() => setAlbumOnlyOpen(false)}>
+          <div className="sc-cmp-box" onClick={(e) => e.stopPropagation()}>
+            <button type="button" className="sc-cmp-x"
+                    onClick={() => setAlbumOnlyOpen(false)}>✕ 关闭</button>
+            <h3 style={{ textAlign: 'center', padding: '40px 0' }}>
+              画册暂不可用（没有可显示的成品）
+            </h3>
+          </div>
+        </div>
+      )}
+
+      {showcaseOpen && (
+        <Showcase items={showcaseItems} families={families}
+                  onClose={() => setShowcaseOpen(false)}
+                  onTryStyle={(it) => {
+                    // ★ 「用这个风格试一张」：跳回创作页并预选该家族。
+                    //   照HelperModal 的 onPickFamily 写法（保持一致）——
+                    //   选中 + 清参数 + 展开示例图，让用户马上看到效果。
+                    if (it?.family) {
+                      setFamilyId(it.family)
+                      setParams({})
+                      lockedRef.current = new Set()
+                      openExample(it.family)
+                    }
+                    setShowcaseOpen(false)
+                  }} />
+      )}
+
       {helperOpen && (
         <HelperModal onClose={() => setHelperOpen(false)} flash={flash}
                      onPickFamily={(fid) => {

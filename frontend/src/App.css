@@ -1978,3 +1978,21 @@ button.placard-chip:disabled { opacity: .5; cursor: not-allowed; }
   .repair { max-height: calc(100vh - 44px); max-height: calc(100dvh - 44px); }
   .dock-body { height: min(52vh, 380px); }
 }
+
+/* ── 作品展入口 ──────────────────────────────────────
+   ★ 用户反馈"UI 为什么是红色的"：项目主色是红（--red-deep），
+   而作品展是旧纸米色系 ⇒ 红色按钮放进去像贴错了。
+   ⇒ 入口改用「描边 + 米白底 + 深墨字」，与作品集同一套语言。
+   ★ 用追加而不是整体改写 App.css（同「规则类文件不整体重写」那条纪律）。*/
+.showcase-entry {
+  background: linear-gradient(180deg, #fdfaf3, #f2e9d6);
+  color: #463d31;
+  border: 1px solid #b8a888;
+  font-weight: 600;
+  letter-spacing: .02em;
+}
+.showcase-entry:hover {
+  background: linear-gradient(180deg, #fffdf7, #f7efdd);
+  border-color: #9c8a66;
+  filter: none;
+}

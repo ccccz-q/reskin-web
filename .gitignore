@@ -114,3 +114,15 @@ backend/_cov_html/
 docs/gallery/
 docs/gallery_webp/
 docs/evidence/ablation/
+
+# ── 参赛成品集（2026-10-09）─────────────────────────────
+# ★ 依据上面同一条标准判断：**能再生就不入库**。
+#   原图：python tools/fetch_album_assets.py
+#   成品：python tools/build_album_assets.py
+# 原图 5 张约 3.9MB + 成品 5 张约 2.7MB，进库会让 clone 变慢，
+# 而这两个脚本能确定性重建 → 不入库，只留脚本与 manifest。
+assets/album/generated/
+frontend/public/album/generated/
+# ★ 但 manifest 要入库 —— 前端靠它渲染成品集，且它是「来源与许可」的留痕。
+!assets/album/manifest.json
+!frontend/public/album/manifest.json
